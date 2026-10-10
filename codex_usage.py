@@ -39,6 +39,7 @@ class UsageSnapshot:
     unlimited_credits: bool
     reached_type: str | None
     fetched_at: float
+    reset_credit_count: int | None = None
 
 
 def _window(value: Any) -> UsageWindow | None:
@@ -104,6 +105,13 @@ def parse_rate_limits(result: dict[str, Any]) -> UsageSnapshot:
     if primary is None and secondary is None:
         raise UsageError("Codex 응답에 사용량 기간 정보가 없습니다.")
 
+    reset_credits = result.get("rateLimitResetCredits")
+    reset_credit_count = None
+    if isinstance(reset_credits, dict):
+        count = reset_credits.get("availableCount")
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            reset_credit_count = count
+
     return UsageSnapshot(
         plan=str(rate_limits.get("planType") or result.get("planType") or "unknown"),
         primary=primary,
@@ -112,6 +120,7 @@ def parse_rate_limits(result: dict[str, Any]) -> UsageSnapshot:
         unlimited_credits=unlimited,
         reached_type=rate_limits.get("rateLimitReachedType"),
         fetched_at=time.time(),
+        reset_credit_count=reset_credit_count,
     )
 
 
@@ -221,8 +230,9 @@ def find_codex_executables() -> list[str]:
     return available
 
 
-def _query_with_executable(executable: str, timeout: float) -> UsageSnapshot:
-    """Fetch one snapshot from one concrete Codex executable."""
+def _query_with_executable(executable: str, timeout: float,
+                           reset_key: str | None = None) -> UsageSnapshot | str:
+    """Read limits or redeem a reset through one concrete Codex executable."""
 
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
@@ -259,6 +269,17 @@ def _query_with_executable(executable: str, timeout: float) -> UsageSnapshot:
         )
         _wait_for_id(reader, 1, deadline)
         _send(process, {"method": "initialized"})
+        if reset_key is not None:
+            _send(process, {
+                "id": 2,
+                "method": "account/rateLimitResetCredit/consume",
+                "params": {"idempotencyKey": reset_key},
+            })
+            result = _wait_for_id(reader, 2, deadline)
+            outcome = result.get("outcome")
+            if outcome not in ("reset", "alreadyRedeemed", "nothingToReset", "noCredit"):
+                raise UsageError("리셋권 사용 결과를 확인할 수 없습니다. 같은 요청으로 다시 확인해 주세요.")
+            return outcome
         _send(process, {"id": 2, "method": "account/rateLimits/read"})
         try:
             result = _wait_for_id(reader, 2, deadline)
@@ -298,9 +319,26 @@ def query_usage(timeout: float = 15.0) -> UsageSnapshot:
     errors: list[str] = []
     for executable in executables:
         try:
-            return _query_with_executable(executable, timeout)
+            snapshot = _query_with_executable(executable, timeout)
+            if not isinstance(snapshot, UsageSnapshot):
+                raise UsageError("Codex 사용량 응답 형식이 올바르지 않습니다.")
+            return snapshot
         except UsageError as exc:
             errors.append(str(exc))
 
     detail = errors[-1] if errors else "알 수 없는 오류"
     raise UsageError(f"Codex에 연결하지 못했습니다: {detail}")
+
+
+def consume_reset_credit(idempotency_key: str, timeout: float = 18.0) -> str:
+    """Redeem once; callers retain the same key after an uncertain result."""
+    if not idempotency_key:
+        raise ValueError("리셋권 사용 요청 키가 필요합니다.")
+    executables = find_codex_executables()
+    if not executables:
+        raise UsageError("Codex 실행 파일을 찾을 수 없습니다.")
+    # Never fall back or automatically retry a mutation after a transport error.
+    outcome = _query_with_executable(executables[0], timeout, reset_key=idempotency_key)
+    if not isinstance(outcome, str):
+        raise UsageError("리셋권 사용 결과 형식이 올바르지 않습니다.")
+    return outcome

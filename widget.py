@@ -11,15 +11,17 @@ import time
 import tkinter as tk
 import webbrowser
 import winreg
+import uuid
 import ctypes
 from ctypes import wintypes
 import logging
 from logging.handlers import RotatingFileHandler
 from decimal import Decimal
+from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox
 
-from codex_usage import UsageSnapshot, find_codex_executables, query_usage
+from codex_usage import UsageSnapshot, consume_reset_credit, find_codex_executables, query_usage
 
 
 BG = "#222127"
@@ -92,20 +94,6 @@ class _MouseHookData(ctypes.Structure):
     ]
 
 
-class _GuiThreadInfo(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.DWORD),
-        ("flags", wintypes.DWORD),
-        ("hwndActive", wintypes.HWND),
-        ("hwndFocus", wintypes.HWND),
-        ("hwndCapture", wintypes.HWND),
-        ("hwndMenuOwner", wintypes.HWND),
-        ("hwndMoveSize", wintypes.HWND),
-        ("hwndCaret", wintypes.HWND),
-        ("rcCaret", _Rect),
-    ]
-
-
 class _MonitorInfo(ctypes.Structure):
     _fields_ = [
         ("cbSize", ctypes.c_ulong),
@@ -166,6 +154,17 @@ def reset_short(timestamp: int | None) -> str:
 
 def usage_color(used_percent: int) -> str:
     return gradient_color(max(0.0, min(1.0, used_percent / 100)))
+
+
+def weekly_reset_date(timestamp: int | None) -> str:
+    """Format the server's weekly reset timestamp in the PC's local time."""
+    if timestamp is None:
+        return "—"
+    try:
+        reset = datetime.fromtimestamp(timestamp)
+    except (OverflowError, OSError, ValueError):
+        return "—"
+    return f"{reset:%m.%d.}"
 
 
 def usage_emoji(used_percent: int | None) -> str:
@@ -256,6 +255,172 @@ def enable_dpi_awareness() -> None:
     raise RuntimeError("Could not enable per-monitor DPI awareness")
 
 
+class PopupMenu:
+    """Tk popup with inert information labels and selectable action rows."""
+
+    def __init__(self, root: tk.Tk, on_close) -> None:
+        self.root = root
+        self.on_close = on_close
+        self.background = "#202628"
+        self.active_background = "#30393B"
+        self.window = tk.Toplevel(root)
+        self.window.withdraw()
+        self.window.overrideredirect(True)
+        self.window.attributes("-topmost", True)
+        self.body = tk.Frame(self.window, bg=self.background,
+                             highlightbackground="#56525F", highlightthickness=1)
+        self.body.pack(fill="both", expand=True)
+        self.entries: list[dict] = []
+        self.selected: int | None = None
+        self.open = False
+        self.window.bind("<Escape>", self._escape)
+        self.window.bind("<Up>", lambda event: self._navigate(-1))
+        self.window.bind("<Down>", lambda event: self._navigate(1))
+        self.window.bind("<Return>", self._activate_selected)
+        self.window.bind("<space>", self._activate_selected)
+        self.window.bind("<FocusOut>", self._focus_out)
+
+    def _add_row(self, kind: str, label: str, state: str = "normal",
+                 command=None, variable: tk.BooleanVar | None = None) -> None:
+        index = len(self.entries)
+        row = tk.Frame(self.body, bg=self.background, bd=0)
+        row.pack(fill="x")
+        indicator = tk.Canvas(row, width=18, height=18, bg=self.background,
+                              bd=0, highlightthickness=0)
+        indicator.pack(side="left", padx=(12, 6))
+        text_widget = tk.Label(row, anchor="w", padx=0, pady=6,
+                               bg=self.background, bd=0, font=("Segoe UI", 9))
+        text_widget.pack(side="left", fill="both", expand=True, padx=(0, 12))
+        self.entries.append(dict(kind=kind, label=label, state=state,
+                                 command=command, variable=variable, widget=row,
+                                 text_widget=text_widget, indicator=indicator))
+        if kind != "info":
+            for target in (row, indicator, text_widget):
+                target.bind("<Enter>", lambda event, i=index: self._select(i))
+                target.bind("<Leave>", lambda event: self._select(None))
+                target.bind("<ButtonRelease-1>", lambda event, i=index: self._invoke(i))
+        # Information labels have no mouse, keyboard, or command bindings.
+        self._render_row(index)
+
+    def add_command(self, *, label: str, command, state: str = "normal") -> None:
+        self._add_row("command", label, state, command)
+
+    def add_info(self, *, label: str) -> None:
+        self._add_row("info", label, "disabled")
+
+    def add_checkbutton(self, *, label: str, variable: tk.BooleanVar, command) -> None:
+        self._add_row("check", label, command=command, variable=variable)
+
+    def add_separator(self) -> None:
+        line = tk.Frame(self.body, bg="#56525F", height=1)
+        line.pack(fill="x", padx=8, pady=4)
+        self.entries.append(dict(kind="separator", widget=line))
+
+    def index(self, index: str) -> int:
+        if index != "end":
+            raise ValueError("Only the end index is supported")
+        return len(self.entries) - 1
+
+    def entryconfigure(self, index: int, **options) -> None:
+        self.entries[index].update(options)
+        if self.selected == index and not self._enabled(index):
+            self.selected = None
+        self._render_row(index)
+        if self.open:
+            self._fit_window(self.window.winfo_x(), self.window.winfo_y())
+
+    def _enabled(self, index: int) -> bool:
+        entry = self.entries[index]
+        return entry["kind"] in ("command", "check") and entry["state"] == "normal"
+
+    def _render_row(self, index: int) -> None:
+        entry = self.entries[index]
+        if entry["kind"] == "separator":
+            return
+        enabled = self._enabled(index)
+        foreground = TEXT if enabled else MUTED
+        background = self.active_background if enabled and self.selected == index else self.background
+        for target in (entry["widget"], entry["text_widget"], entry["indicator"]):
+            target.configure(bg=background, cursor="hand2" if enabled else "arrow")
+        entry["text_widget"].configure(text=entry["label"], fg=foreground)
+        indicator = entry["indicator"]
+        indicator.delete("all")
+        if entry["kind"] == "check":
+            # Draw the check instead of depending on a font's Unicode glyph.
+            indicator.create_rectangle(2, 2, 15, 15, outline=foreground)
+            if entry["variable"].get():
+                indicator.create_line(4, 8, 7, 11, 13, 5, fill=foreground, width=2)
+
+    def _select(self, index: int | None) -> None:
+        previous = self.selected
+        self.selected = index if index is not None and self._enabled(index) else None
+        for candidate in (previous, self.selected):
+            if candidate is not None:
+                self._render_row(candidate)
+
+    def _navigate(self, step: int) -> str:
+        choices = [i for i in range(len(self.entries)) if self._enabled(i)]
+        if choices:
+            if self.selected in choices:
+                index = (choices.index(self.selected) + step) % len(choices)
+            else:
+                index = 0 if step > 0 else -1
+            self._select(choices[index])
+        return "break"
+
+    def _activate_selected(self, event: tk.Event) -> str:
+        if self.selected is not None:
+            self._invoke(self.selected)
+        return "break"
+
+    def _invoke(self, index: int) -> None:
+        if not self.open or not self._enabled(index):
+            return
+        entry = self.entries[index]
+        self.close()
+        if entry["kind"] == "check":
+            entry["variable"].set(not entry["variable"].get())
+        entry["command"]()
+
+    def show(self, x: int, y: int) -> None:
+        self._select(None)
+        for index in range(len(self.entries)):
+            self._render_row(index)
+        self._fit_window(x, y)
+        self.window.deiconify()
+        self.window.lift()
+        self.open = True
+        self.window.focus_force()
+
+    def _fit_window(self, x: int, y: int) -> None:
+        self.window.update_idletasks()
+        width, height = self.window.winfo_reqwidth(), self.window.winfo_reqheight()
+        area = monitor_work_area(x, y, width, height)
+        x, y = clamp_position(x, y, width, height, area)
+        self.window.geometry(f"{width}x{height}+{x}+{y}")
+
+    def close(self) -> None:
+        if not self.open:
+            return
+        self.open = False
+        self.window.withdraw()
+        self._select(None)
+        self.on_close()
+
+    def _escape(self, event: tk.Event) -> str:
+        self.close()
+        return "break"
+
+    def _focus_out(self, event: tk.Event) -> None:
+        self.window.after_idle(self._close_if_unfocused)
+
+    def _close_if_unfocused(self) -> None:
+        if self.open:
+            focused = self.window.focus_get()
+            if focused is None or focused.winfo_toplevel() is not self.window:
+                self.close()
+
+
 class UsageWidget:
     def __init__(self) -> None:
         enable_dpi_awareness()
@@ -272,6 +437,9 @@ class UsageWidget:
         self.drag_origin: tuple[int, int] | None = None
         self.results: queue.Queue[tuple[int, str, object]] = queue.Queue()
         self.refreshing = False
+        self.resetting = False
+        self.reset_request_key: str | None = None
+        self.reset_results: queue.Queue[tuple[str, object]] = queue.Queue()
         self.fetch_generation = 0
         self.failure_count = 0
         self.recovery_after_id: str | None = None
@@ -285,6 +453,7 @@ class UsageWidget:
         self._enable_click_through()
         self.refresh()
         self.root.after(500, self._drain_results)
+        self.root.after(500, self._drain_reset_results)
         self.root.after(60_000, self._update_clock)
         self.root.after(60_000, self._scheduled_refresh)
 
@@ -296,13 +465,12 @@ class UsageWidget:
         header.pack(fill="both", expand=True, padx=7)
         header.pack_propagate(True)
         self.header = header
-        # Reserve the right edge before packing the usage labels.
-        self.reset_compact = tk.Label(header, text="↻ —", fg=MUTED, bg=BG, font=("Segoe UI", 8))
-        self.reset_compact.pack(side="right", padx=(5, 0))
         self.five_label = tk.Label(header, text="5H —%", fg=TEXT, bg=BG, font=("Segoe UI Semibold", 8))
         self.five_label.pack(side="left")
         self.five_meter = tk.Canvas(header, width=28, height=10, bg=BG, bd=0, highlightthickness=0)
         self.five_meter.pack(side="left", padx=(3, 5))
+        self.reset_compact = tk.Label(header, text="↻ —", fg=MUTED, bg=BG, font=("Segoe UI", 8))
+        self.reset_compact.pack(side="left", padx=(0, 8))
 
         tk.Frame(header, bg="#56525F", width=1, height=18).pack(side="left", padx=(0, 5))
 
@@ -310,12 +478,20 @@ class UsageWidget:
         self.week_label.pack(side="left")
         self.week_meter = tk.Canvas(header, width=28, height=10, bg=BG, bd=0, highlightthickness=0)
         self.week_meter.pack(side="left", padx=(3, 5))
+        self.week_reset = tk.Label(header, text="—", fg=MUTED, bg=BG, font=("Segoe UI", 8))
+        self.week_reset.pack(side="left")
 
-        self.menu = tk.Menu(self.root, tearoff=False, bg="#202628", fg=TEXT,
-                            activebackground="#30393B", activeforeground=TEXT)
+        self.menu = PopupMenu(self.root, self._menu_closed)
         self.menu.add_command(label="지금 새로고침", command=self.refresh)
-        self.menu.add_command(label="크레딧 —", state="disabled")
-        self.menu.add_command(label="연결 상태", command=self._show_connection_status)
+        self.menu.add_info(label="연결 상태: 확인 전")
+        self.connection_status_index = self.menu.index("end")
+        self.menu.add_separator()
+        self.menu.add_info(label="크레딧: —")
+        self.credit_index = self.menu.index("end")
+        self.menu.add_info(label="사용량 리셋권: —")
+        self.reset_count_index = self.menu.index("end")
+        self.menu.add_command(label="리셋권 사용하기", state="disabled", command=self._use_reset_credit)
+        self.reset_use_index = self.menu.index("end")
         self.menu.add_separator()
         self.menu.add_checkbutton(label="항상 맨 위에 표시", variable=self.always_on_top, command=self._toggle_topmost)
         self.menu.add_checkbutton(label="Windows 시작 시 자동 실행", variable=self.autostart, command=self._toggle_autostart)
@@ -325,7 +501,7 @@ class UsageWidget:
         self._fit_content_width()
 
     def _fit_content_width(self) -> None:
-        """Keep the reset countdown visible as fonts and percentages change width."""
+        """Keep reset times visible as fonts and percentages change width."""
         self.root.update_idletasks()
         # Header horizontal padding (7 each side) plus the outer border (1 each side).
         width = max(WINDOW_WIDTH, self.header.winfo_reqwidth() + 16)
@@ -369,13 +545,7 @@ class UsageWidget:
             "SetWindowLongW": ([ctypes.c_void_p, ctypes.c_int, ctypes.c_long], ctypes.c_long),
             "GetWindowRect": ([ctypes.c_void_p, ctypes.POINTER(_Rect)], ctypes.c_int),
             "IsWindowVisible": ([ctypes.c_void_p], ctypes.c_int),
-            "GetWindowThreadProcessId": ([wintypes.HWND, ctypes.POINTER(wintypes.DWORD)],
-                                          wintypes.DWORD),
-            "GetGUIThreadInfo": ([wintypes.DWORD, ctypes.POINTER(_GuiThreadInfo)], ctypes.c_int),
             "WindowFromPoint": ([wintypes.POINT], wintypes.HWND),
-            "GetClassNameW": ([wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int], ctypes.c_int),
-            "PostMessageW": ([wintypes.HWND, ctypes.c_uint, ctypes.c_size_t,
-                              ctypes.c_ssize_t], ctypes.c_int),
             "SetWindowsHookExW": ([ctypes.c_int, self._hook_type, ctypes.c_void_p,
                                     ctypes.c_ulong], ctypes.c_void_p),
             "CallNextHookEx": ([ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t,
@@ -393,10 +563,10 @@ class UsageWidget:
             function.argtypes, function.restype = arguments, result
         self.root.update_idletasks()
         self._input_hwnd = api.GetAncestor(self.root.winfo_id(), 2)  # GA_ROOT
-        self._input_thread_id = api.GetWindowThreadProcessId(self._input_hwnd, None)
         self._mouse_events = queue.SimpleQueue()
         self._right_captured = False
         self._menu_open = False
+        self._menu_hwnd = None
         self._dragged = False
         self._drag_threshold = (max(1, api.GetSystemMetrics(68)),
                                 max(1, api.GetSystemMetrics(69)))  # SM_CX/YDRAG
@@ -498,27 +668,19 @@ class UsageWidget:
         return self._input_api.CallNextHookEx(None, code, message, data)
 
     def _dismiss_menu_outside(self, x: int, y: int) -> None:
-        """Cancel the native popup from the hook without calling Tk across threads."""
+        """Queue dismissal while leaving the outside click to its target app."""
         api = self._input_api
-        info = _GuiThreadInfo()
-        info.cbSize = ctypes.sizeof(info)
-        if not api.GetGUIThreadInfo(self._input_thread_id, ctypes.byref(info)):
-            return
-        if not info.hwndMenuOwner:
-            return
         hwnd = api.WindowFromPoint(wintypes.POINT(x, y))
-        name = ctypes.create_unicode_buffer(256)
-        api.GetClassNameW(hwnd, name, len(name))
-        if (name.value == "#32768"
-                and api.GetWindowThreadProcessId(hwnd, None) == self._input_thread_id):
-            return  # Leave clicks on this thread's native menu to Windows.
-        # Tk's popup uses a separate native owner; its modal loop pauses Tk timers.
-        api.PostMessageW(info.hwndMenuOwner, 0x1F, 0, 0)  # WM_CANCELMODE
+        if self._menu_hwnd and api.GetAncestor(hwnd, 2) == self._menu_hwnd:
+            return
+        self._mouse_events.put(("dismiss", x, y))
 
     def _drain_mouse_events(self) -> None:
         while not self._mouse_events.empty():
             action, x, y = self._mouse_events.get_nowait()
-            if action == "down":
+            if action == "dismiss":
+                self.menu.close()
+            elif action == "down":
                 self._right_start = (x, y)
                 self.drag_origin = (x - self.root.winfo_x(), y - self.root.winfo_y())
                 self._dragged = False
@@ -544,12 +706,14 @@ class UsageWidget:
         self.root.geometry(f"+{x}+{y}")
 
     def _show_menu(self, x: int, y: int) -> None:
+        self._update_connection_status()
+        self.menu.show(x, y)
+        self._menu_hwnd = self._input_api.GetAncestor(self.menu.window.winfo_id(), 2)
         self._menu_open = True
-        try:
-            self.menu.tk_popup(x, y)
-        finally:
-            self.menu.grab_release()
-            self._menu_open = False
+
+    def _menu_closed(self) -> None:
+        self._menu_open = False
+        self._menu_hwnd = None
 
     def _release_mouse_hook(self, event: tk.Event) -> None:
         if event.widget is self.root and hasattr(self, "_hook_thread"):
@@ -589,12 +753,14 @@ class UsageWidget:
             canvas.create_rectangle(x, 2, x + segment_width, 8, fill=fill, outline="")
 
     def refresh(self) -> None:
-        if self.refreshing:
+        if self.refreshing or self.resetting:
             return
         self.refreshing = True
         self.fetch_generation += 1
         generation = self.fetch_generation
         self.menu.entryconfigure(0, state="disabled")
+        self._update_connection_status()
+        self._update_reset_menu()
         if self.snapshot is None:
             self.reset_compact.configure(text="…", fg=MUTED)
         threading.Thread(target=self._fetch_worker, args=(generation,), daemon=True).start()
@@ -641,6 +807,7 @@ class UsageWidget:
             self.failure_count = 0
             self.reset_compact.unbind("<Button-1>")
             self.snapshot = payload
+            self._update_connection_status()
             self._render(payload)
             LOGGER.info("Usage refreshed successfully")
         else:
@@ -650,6 +817,8 @@ class UsageWidget:
 
     def _handle_connection_error(self, message: str) -> None:
         self.last_error = message
+        self._update_connection_status()
+        self._update_reset_menu()
         self.failure_count += 1
         LOGGER.warning("Refresh failed (%s): %s", self.failure_count, message)
         self._render_connection_issue()
@@ -667,18 +836,101 @@ class UsageWidget:
         self.reset_compact.bind("<Button-1>", lambda _event: self.refresh())
         self._fit_content_width()
 
-    def _show_connection_status(self) -> None:
-        if self.last_error:
-            messagebox.showwarning(
-                "Codex Usage",
-                f"자동으로 다시 연결을 시도하고 있습니다.\n\n{self.last_error}\n\n로그: {diagnostic_log_path()}",
-            )
+    def _update_connection_status(self) -> None:
+        """Display cached query state without starting a connection check."""
+        if self.refreshing:
+            status = "조회 중"
+        elif self.last_error:
+            status = "재연결 중"
+        elif self.snapshot is not None:
+            status = "정상"
         else:
-            messagebox.showinfo("Codex Usage", "Codex에 정상적으로 연결되어 있습니다.")
+            status = "확인 전"
+        self.menu.entryconfigure(self.connection_status_index, label=f"연결 상태: {status}")
 
     def _recovery_refresh(self) -> None:
         self.recovery_after_id = None
         self.refresh()
+
+    def _update_reset_menu(self) -> None:
+        count = self.snapshot.reset_credit_count if self.snapshot else None
+        self.menu.entryconfigure(
+            self.reset_count_index,
+            label=f"사용량 리셋권: {count}개" if count is not None else "사용량 리셋권: 조회 불가",
+        )
+        retry = self.reset_request_key is not None
+        enabled = (not self.resetting and not self.refreshing
+                   and (retry or (not self.last_error and count is not None and count > 0)))
+        label = "리셋권 사용 결과 재확인" if retry else "리셋권 사용하기"
+        if self.resetting:
+            label = "리셋권 사용 처리 중…"
+        self.menu.entryconfigure(self.reset_use_index, label=label,
+                                 state="normal" if enabled else "disabled")
+
+    def _use_reset_credit(self) -> None:
+        if self.resetting or self.refreshing:
+            return
+        retry = self.reset_request_key is not None
+        if not retry and (self.last_error or self.snapshot is None
+                          or not self.snapshot.reset_credit_count):
+            return
+        prompt = (
+            "이전 리셋권 사용 요청의 결과를 같은 요청 키로 다시 확인합니다.\n계속하시겠습니까?"
+            if retry else
+            "사용량 리셋권 1개를 사용하시겠습니까?\n\n"
+            "초기화 대상 기간은 서버가 결정하며, 주간 사용량만 지정할 수는 없습니다."
+        )
+        if not messagebox.askyesno("사용량 리셋권", prompt, parent=self.root):
+            return
+        # Tk modal dialogs keep timers running, including scheduled refreshes.
+        if self.resetting or self.refreshing:
+            messagebox.showinfo("사용량 리셋권", "조회가 끝난 뒤 다시 선택해 주세요.", parent=self.root)
+            return
+        if not retry and (self.last_error or self.snapshot is None
+                          or not self.snapshot.reset_credit_count):
+            return
+        if self.reset_request_key is None:
+            self.reset_request_key = str(uuid.uuid4())
+        self.resetting = True
+        self.menu.entryconfigure(0, state="disabled")
+        self._update_reset_menu()
+        threading.Thread(target=self._reset_worker,
+                         args=(self.reset_request_key,), daemon=True).start()
+
+    def _reset_worker(self, request_key: str) -> None:
+        try:
+            self.reset_results.put(("ok", consume_reset_credit(request_key)))
+        except Exception as exc:
+            self.reset_results.put(("error", str(exc)))
+
+    def _drain_reset_results(self) -> None:
+        try:
+            kind, payload = self.reset_results.get_nowait()
+        except queue.Empty:
+            self.root.after(500, self._drain_reset_results)
+            return
+        self.resetting = False
+        self.menu.entryconfigure(0, state="normal")
+        if kind == "ok":
+            self.reset_request_key = None
+            messages = {
+                "reset": "리셋권 1개를 사용했습니다. 사용량과 남은 개수를 다시 조회합니다.",
+                "alreadyRedeemed": "이 요청은 이미 처리되었습니다. 사용량과 남은 개수를 다시 조회합니다.",
+                "nothingToReset": "현재 초기화할 수 있는 사용량 기간이 없습니다.",
+                "noCredit": "사용 가능한 리셋권이 없습니다.",
+            }
+            self.refresh()
+            messagebox.showinfo("사용량 리셋권", messages[str(payload)], parent=self.root)
+        else:
+            self._update_reset_menu()
+            messagebox.showwarning(
+                "사용량 리셋권",
+                f"리셋권 사용 결과를 확인하지 못했습니다.\n{payload}\n\n"
+                "위젯을 종료하지 말고 ‘리셋권 사용 결과 재확인’을 선택해 주세요.\n"
+                "같은 요청 키를 사용하여 중복 사용을 방지합니다.",
+                parent=self.root,
+            )
+        self.root.after(500, self._drain_reset_results)
 
     def _render(self, snapshot: UsageSnapshot) -> None:
         primary = snapshot.primary
@@ -697,6 +949,9 @@ class UsageWidget:
             self._draw_segments(self.five_meter, None, None)
 
         secondary = snapshot.secondary
+        self.week_reset.configure(
+            text=weekly_reset_date(secondary.resets_at if secondary else None)
+        )
         if secondary:
             secondary_color = usage_color(secondary.used_percent)
             self.week_label.configure(text=f"WK {secondary.used_percent}%", fg=secondary_color)
@@ -715,7 +970,8 @@ class UsageWidget:
             credit_text = f"{snapshot.credit_balance.quantize(Decimal('0.01'))}"
         else:
             credit_text = "—"
-        self.menu.entryconfigure(1, label=f"크레딧 {credit_text}")
+        self.menu.entryconfigure(self.credit_index, label=f"크레딧: {credit_text}")
+        self._update_reset_menu()
         self._fit_content_width()
 
     def _update_clock(self) -> None:
