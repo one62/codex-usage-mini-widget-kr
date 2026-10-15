@@ -23,6 +23,7 @@ from tkinter import messagebox
 from tkinter import font as tkfont
 
 from codex_usage import UsageSnapshot, consume_reset_credit, find_codex_executables, query_usage
+from widget_settings import load_settings, save_settings
 
 
 BG = "#222127"
@@ -279,6 +280,10 @@ class PopupMenu:
         self.window.bind("<Down>", lambda event: self._navigate(1))
         self.window.bind("<Return>", self._activate_selected)
         self.window.bind("<space>", self._activate_selected)
+        self.window.bind("<Left>", lambda event: self._adjust_scale(-1))
+        self.window.bind("<Right>", lambda event: self._adjust_scale(1))
+        self.window.bind("<Home>", lambda event: self._adjust_scale(endpoint=0))
+        self.window.bind("<End>", lambda event: self._adjust_scale(endpoint=100))
         self.window.bind("<FocusOut>", self._focus_out)
 
     def _add_row(self, kind: str, label: str, state: str = "normal",
@@ -312,6 +317,63 @@ class PopupMenu:
     def add_checkbutton(self, *, label: str, variable: tk.BooleanVar, command) -> None:
         self._add_row("check", label, command=command, variable=variable)
 
+    def add_scale(self, *, label: str, variable: tk.IntVar, command) -> None:
+        index = len(self.entries)
+        row = tk.Frame(self.body, bg=self.background)
+        row.pack(fill="x", padx=12, pady=4)
+        caption = tk.Frame(row, bg=self.background)
+        caption.pack(fill="x")
+        text_widget = tk.Label(caption, text=label, anchor="w", bg=self.background,
+                               fg=TEXT, font=("Segoe UI", 9))
+        text_widget.pack(side="left")
+        font = tkfont.Font(self.root, family="Segoe UI", size=9)
+        value_box = tk.Frame(caption, bg=self.background,
+                             width=font.measure("100%") + 4, height=font.metrics("linespace") + 4)
+        value_box.pack(side="right")
+        value_box.pack_propagate(False)
+        value_widget = tk.Label(value_box, text=f"{variable.get()}%", anchor="e",
+                                bg=self.background, fg=TEXT, font=font)
+        value_widget.pack(fill="both", expand=True)
+        scale = tk.Scale(
+            row, from_=0, to=100, resolution=1, orient="horizontal",
+            variable=variable, showvalue=False, length=210, width=12,
+            sliderlength=16, bd=0, highlightthickness=0, takefocus=True,
+            bg=self.background, troughcolor="#424149", activebackground="#8CD9F5",
+            command=lambda value, i=index: self._scale_changed(i, value),
+        )
+        scale.pack(fill="x")
+        self.entries.append(dict(kind="scale", label=label, state="normal",
+                                 command=command, variable=variable, widget=row,
+                                 text_widget=text_widget, value_widget=value_widget,
+                                 scale=scale, font=font))
+        for target in (row, caption, text_widget, value_widget, scale):
+            target.bind("<Enter>", lambda event, i=index: self._select(i))
+        scale.bind("<ButtonPress-1>", lambda event, i=index: self._select(i), add="+")
+        scale.bind("<FocusIn>", lambda event, i=index: self._select(i))
+        scale.bind("<Up>", lambda event: self._navigate(-1))
+        scale.bind("<Down>", lambda event: self._navigate(1))
+        scale.bind("<Left>", lambda event: self._adjust_scale(-1))
+        scale.bind("<Right>", lambda event: self._adjust_scale(1))
+        scale.bind("<Home>", lambda event: self._adjust_scale(endpoint=0))
+        scale.bind("<End>", lambda event: self._adjust_scale(endpoint=100))
+        scale.bind("<Return>", self._activate_selected)
+        scale.bind("<space>", self._activate_selected)
+
+    def _scale_changed(self, index: int, value: str) -> None:
+        entry = self.entries[index]
+        number = max(0, min(100, round(float(value))))
+        # Keep the track fixed while dragging, including 9 -> 10 -> 100%.
+        entry["value_widget"].configure(text=f"{number}%")
+        entry["command"](number)
+
+    def _adjust_scale(self, delta: int = 0, *, endpoint: int | None = None) -> str:
+        if self.selected is not None:
+            entry = self.entries[self.selected]
+            if entry["kind"] == "scale":
+                value = endpoint if endpoint is not None else entry["variable"].get() + delta
+                entry["scale"].set(max(0, min(100, value)))
+        return "break"
+
     def add_separator(self) -> None:
         line = tk.Frame(self.body, bg="#56525F", height=1)
         line.pack(fill="x", padx=8, pady=4)
@@ -332,11 +394,14 @@ class PopupMenu:
 
     def _enabled(self, index: int) -> bool:
         entry = self.entries[index]
-        return entry["kind"] in ("command", "check") and entry["state"] == "normal"
+        return entry["kind"] in ("command", "check", "scale") and entry["state"] == "normal"
 
     def _render_row(self, index: int) -> None:
         entry = self.entries[index]
         if entry["kind"] == "separator":
+            return
+        if entry["kind"] == "scale":
+            entry["text_widget"].configure(fg=TEXT if self.selected == index else MUTED)
             return
         enabled = self._enabled(index)
         foreground = TEXT if enabled else MUTED
@@ -378,6 +443,9 @@ class PopupMenu:
         if not self.open or not self._enabled(index):
             return
         entry = self.entries[index]
+        if entry["kind"] == "scale":
+            entry["scale"].focus_set()
+            return
         self.close()
         if entry["kind"] == "check":
             entry["variable"].set(not entry["variable"].get())
@@ -425,6 +493,10 @@ class PopupMenu:
 class UsageWidget:
     def __init__(self) -> None:
         enable_dpi_awareness()
+        self.settings = load_settings()
+        self._settings_after_id: str | None = None
+        self._settings_ready = False
+        self._closing = False
         self.root = tk.Tk()
         self.root.title("ChatGPT Usage")
         self.root.configure(bg=BG)
@@ -433,7 +505,8 @@ class UsageWidget:
         if os.environ.get("CHATGPT_USAGE_WIDGET_VISUAL_QA") != "1":
             self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 0.7)
+        self.transparency = tk.IntVar(master=self.root, value=self.settings.transparency)
+        self.root.attributes("-alpha", 1.0 - self.transparency.get() / 100)
         self.snapshot: UsageSnapshot | None = None
         self.drag_origin: tuple[int, int] | None = None
         self.results: queue.Queue[tuple[int, str, object]] = queue.Queue()
@@ -448,10 +521,11 @@ class UsageWidget:
         self.always_on_top = tk.BooleanVar(value=True)
         self.autostart = tk.BooleanVar(value=autostart_enabled())
         self._build()
-        self._position_top_right()
+        self._restore_position()
         self._apply_rounded_corners()
         self._bind_actions()
         self._enable_click_through()
+        self._settings_ready = True
         self.refresh()
         self.root.after(500, self._drain_results)
         self.root.after(500, self._drain_reset_results)
@@ -466,6 +540,7 @@ class UsageWidget:
         header.pack(fill="both", expand=True, padx=7)
         header.pack_propagate(True)
         self.header = header
+
         percent_font = tkfont.Font(self.root, family="Segoe UI Semibold", size=8)
         reset_font = tkfont.Font(self.root, family="Segoe UI", size=8)
         weekly_dates = (
@@ -522,11 +597,14 @@ class UsageWidget:
         self.menu.add_command(label="리셋권 사용하기", state="disabled", command=self._use_reset_credit)
         self.reset_use_index = self.menu.index("end")
         self.menu.add_separator()
+        self.menu.add_scale(label="투명도", variable=self.transparency,
+                            command=self._set_transparency)
+        self.menu.add_separator()
         self.menu.add_checkbutton(label="항상 맨 위에 표시", variable=self.always_on_top, command=self._toggle_topmost)
         self.menu.add_checkbutton(label="Windows 시작 시 자동 실행", variable=self.autostart, command=self._toggle_autostart)
         self.menu.add_separator()
         self.menu.add_command(label="ChatGPT 데스크톱 열기", command=self._open_chatgpt)
-        self.menu.add_command(label="종료", command=self.root.destroy)
+        self.menu.add_command(label="종료", command=self._close)
         self._fit_content_width()
 
     def _fit_content_width(self) -> None:
@@ -541,8 +619,52 @@ class UsageWidget:
         self.root.geometry(f"{width}x{WINDOW_HEIGHT}+{x}+{y}")
 
     def _bind_actions(self) -> None:
-        self.root.bind("<Escape>", lambda _event: self.root.destroy())
+        self.root.bind("<Escape>", lambda _event: self._close())
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.root.bind("<Destroy>", self._release_mouse_hook, add="+")
+        self.root.bind("<Configure>", self._position_changed, add="+")
+
+    def _restore_position(self) -> None:
+        if self.settings.x is None or self.settings.y is None:
+            self._position_top_right()
+            return
+        self.root.update_idletasks()
+        width = self.root.winfo_width()
+        x, y = self.settings.x, self.settings.y
+        area = monitor_work_area(x, y, width, WINDOW_HEIGHT)
+        x, y = clamp_position(x, y, width, WINDOW_HEIGHT, area)
+        self.root.geometry(f"+{x}+{y}")
+
+    def _position_changed(self, event: tk.Event) -> None:
+        if event.widget is self.root:
+            self._schedule_settings_save()
+
+    def _schedule_settings_save(self) -> None:
+        if not self._settings_ready or self._closing:
+            return
+        if self._settings_after_id is not None:
+            self.root.after_cancel(self._settings_after_id)
+        self._settings_after_id = self.root.after(350, self._save_preferences)
+
+    def _save_preferences(self) -> None:
+        self._settings_after_id = None
+        # Read the Scale variable directly: its command can still be pending
+        # when the user closes the widget immediately after the last adjustment.
+        self.settings.transparency = self.transparency.get()
+        self.settings.x, self.settings.y = self.root.winfo_x(), self.root.winfo_y()
+        try:
+            save_settings(self.settings)
+        except OSError as exc:
+            LOGGER.warning("Could not save widget settings: %s", exc)
+
+    def _close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        if self._settings_after_id is not None:
+            self.root.after_cancel(self._settings_after_id)
+        self._save_preferences()
+        self.root.destroy()
 
     def _position_top_right(self) -> None:
         self.root.update_idletasks()
@@ -751,6 +873,10 @@ class UsageWidget:
 
     def _toggle_topmost(self) -> None:
         self.root.attributes("-topmost", self.always_on_top.get())
+
+    def _set_transparency(self, value: int) -> None:
+        self.root.attributes("-alpha", 1.0 - max(0, min(100, value)) / 100)
+        self._schedule_settings_save()
 
     def _toggle_autostart(self) -> None:
         try:
