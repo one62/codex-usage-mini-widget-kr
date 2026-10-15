@@ -20,6 +20,7 @@ from decimal import Decimal
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox
+from tkinter import font as tkfont
 
 from codex_usage import UsageSnapshot, consume_reset_credit, find_codex_executables, query_usage
 
@@ -465,21 +466,49 @@ class UsageWidget:
         header.pack(fill="both", expand=True, padx=7)
         header.pack_propagate(True)
         self.header = header
-        self.five_label = tk.Label(header, text="5H —%", fg=TEXT, bg=BG, font=("Segoe UI Semibold", 8))
-        self.five_label.pack(side="left")
+        percent_font = tkfont.Font(self.root, family="Segoe UI Semibold", size=8)
+        reset_font = tkfont.Font(self.root, family="Segoe UI", size=8)
+        weekly_dates = (
+            f"{month:02d}.{day:02d}."
+            for month, month_days in enumerate((31, 29, 31, 30, 31, 30,
+                                                31, 31, 30, 31, 30, 31), start=1)
+            for day in range(1, month_days + 1)
+        )
+        widest_weekly_date = max(weekly_dates, key=reset_font.measure)
+
+        def add_right_aligned_label(text: str, max_text: str, color: str,
+                                    font: tkfont.Font,
+                                    padx: tuple[int, int] = (0, 0)) -> tk.Label:
+            # Measure with Tk's active font metrics, which already reflect DPI scaling.
+            column = tk.Frame(header, width=font.measure(max_text), height=18, bg=BG)
+            column.pack_propagate(False)
+            label = tk.Label(
+                column, text=text, anchor="e", padx=0, pady=0,
+                fg=color, bg=BG, font=font,
+            )
+            label.pack(fill="both", expand=True)
+            column.pack(side="left", padx=padx)
+            return label
+
+        self.five_label = add_right_aligned_label(
+            "5H —%", "5H 100%", TEXT, percent_font,
+        )
         self.five_meter = tk.Canvas(header, width=28, height=10, bg=BG, bd=0, highlightthickness=0)
         self.five_meter.pack(side="left", padx=(3, 5))
-        self.reset_compact = tk.Label(header, text="↻ —", fg=MUTED, bg=BG, font=("Segoe UI", 8))
-        self.reset_compact.pack(side="left", padx=(0, 8))
+        self.reset_compact = add_right_aligned_label(
+            "↻ —", "↻ 5h 59m", MUTED, reset_font, padx=(0, 8),
+        )
 
         tk.Frame(header, bg="#56525F", width=1, height=18).pack(side="left", padx=(0, 5))
 
-        self.week_label = tk.Label(header, text="WK —%", fg=TEXT, bg=BG, font=("Segoe UI Semibold", 8))
-        self.week_label.pack(side="left")
+        self.week_label = add_right_aligned_label(
+            "WK —%", "WK 100%", TEXT, percent_font,
+        )
         self.week_meter = tk.Canvas(header, width=28, height=10, bg=BG, bd=0, highlightthickness=0)
         self.week_meter.pack(side="left", padx=(3, 5))
-        self.week_reset = tk.Label(header, text="—", fg=MUTED, bg=BG, font=("Segoe UI", 8))
-        self.week_reset.pack(side="left")
+        self.week_reset = add_right_aligned_label(
+            "—", widest_weekly_date, MUTED, reset_font,
+        )
 
         self.menu = PopupMenu(self.root, self._menu_closed)
         self.menu.add_command(label="지금 새로고침", command=self.refresh)
@@ -501,9 +530,10 @@ class UsageWidget:
         self._fit_content_width()
 
     def _fit_content_width(self) -> None:
-        """Keep reset times visible as fonts and percentages change width."""
+        """Fit the window to fixed pixel columns measured at the current DPI."""
         self.root.update_idletasks()
-        # Header horizontal padding (7 each side) plus the outer border (1 each side).
+        # Label columns have fixed pixel widths, so content changes cannot resize it.
+        # Tk font metrics are DPI-aware because awareness is enabled before Tk starts.
         width = max(WINDOW_WIDTH, self.header.winfo_reqwidth() + 16)
         x, y = self.root.winfo_x(), self.root.winfo_y()
         area = monitor_work_area(x, y, width, WINDOW_HEIGHT)
