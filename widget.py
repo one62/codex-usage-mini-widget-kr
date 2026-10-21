@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import os
 import queue
 import subprocess
@@ -43,6 +44,7 @@ GRADIENT_STOPS = (
 )
 WINDOW_WIDTH = 270
 WINDOW_HEIGHT = 38
+FONT_FAMILY = "NanumBarunGothic"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "ChatGPTUsageWidget"
 RECOVERY_DELAYS = (15, 30, 60, 120, 300)
@@ -70,6 +72,22 @@ def _configure_logger() -> logging.Logger:
 
 
 LOGGER = _configure_logger()
+
+
+def load_bundled_fonts() -> None:
+    font_directory = Path(__file__).resolve().parent / "assets" / "fonts"
+    gdi32 = ctypes.WinDLL("gdi32")
+    gdi32.AddFontResourceExW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
+    gdi32.AddFontResourceExW.restype = ctypes.c_int
+    gdi32.RemoveFontResourceExW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
+    gdi32.RemoveFontResourceExW.restype = wintypes.BOOL
+    private_font = 0x10  # FR_PRIVATE: available only to this process.
+    for filename in ("NanumBarunGothic.ttf", "NanumBarunGothicBold.ttf"):
+        path = str(font_directory / filename)
+        if gdi32.AddFontResourceExW(path, private_font, None):
+            atexit.register(gdi32.RemoveFontResourceExW, path, private_font, None)
+        else:
+            LOGGER.warning("Could not load bundled font: %s", path)
 
 
 def recovery_delay(failure_count: int) -> int:
@@ -139,19 +157,19 @@ def monitor_work_area(x: int, y: int, width: int, height: int) -> tuple[int, int
 
 def reset_short(timestamp: int | None) -> str:
     if timestamp is None:
-        return "↻ —"
+        return "—"
     seconds = max(0, timestamp - int(time.time()))
     if seconds == 0:
-        return "↻ now"
+        return "now"
     # Round up to minutes so a positive remainder never appears as zero.
     total_minutes = (seconds + 59) // 60
     days, remainder = divmod(total_minutes, 1440)
     hours, minutes = divmod(remainder, 60)
     if days:
-        return f"↻ {days}d {hours}h {minutes}m"
+        return f"{days}d {hours}h {minutes}m"
     if hours:
-        return f"↻ {hours}h {minutes}m"
-    return f"↻ {minutes}m"
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 
 def usage_color(used_percent: int) -> str:
@@ -263,6 +281,8 @@ class PopupMenu:
     def __init__(self, root: tk.Tk, on_close) -> None:
         self.root = root
         self.on_close = on_close
+        self.font = tkfont.nametofont("TkMenuFont", root=root).copy()
+        self.font.configure(family=FONT_FAMILY)
         self.background = "#202628"
         self.active_background = "#30393B"
         self.window = tk.Toplevel(root)
@@ -295,7 +315,7 @@ class PopupMenu:
                               bd=0, highlightthickness=0)
         indicator.pack(side="left", padx=(12, 6))
         text_widget = tk.Label(row, anchor="w", padx=0, pady=6,
-                               bg=self.background, bd=0, font=("Segoe UI", 9))
+                               bg=self.background, bd=0, font=self.font)
         text_widget.pack(side="left", fill="both", expand=True, padx=(0, 12))
         self.entries.append(dict(kind=kind, label=label, state=state,
                                  command=command, variable=variable, widget=row,
@@ -324,9 +344,9 @@ class PopupMenu:
         caption = tk.Frame(row, bg=self.background)
         caption.pack(fill="x")
         text_widget = tk.Label(caption, text=label, anchor="w", bg=self.background,
-                               fg=TEXT, font=("Segoe UI", 9))
+                               fg=TEXT, font=self.font)
         text_widget.pack(side="left")
-        font = tkfont.Font(self.root, family="Segoe UI", size=9)
+        font = self.font
         value_box = tk.Frame(caption, bg=self.background,
                              width=font.measure("100%") + 4, height=font.metrics("linespace") + 4)
         value_box.pack(side="right")
@@ -493,6 +513,7 @@ class PopupMenu:
 class UsageWidget:
     def __init__(self) -> None:
         enable_dpi_awareness()
+        load_bundled_fonts()
         self.settings = load_settings()
         self._settings_after_id: str | None = None
         self._settings_ready = False
@@ -541,8 +562,8 @@ class UsageWidget:
         header.pack_propagate(True)
         self.header = header
 
-        percent_font = tkfont.Font(self.root, family="Segoe UI Semibold", size=8)
-        reset_font = tkfont.Font(self.root, family="Segoe UI", size=8)
+        percent_font = tkfont.Font(self.root, family=FONT_FAMILY, size=8, weight="bold")
+        reset_font = tkfont.Font(self.root, family=FONT_FAMILY, size=8)
         weekly_dates = (
             f"{month:02d}.{day:02d}."
             for month, month_days in enumerate((31, 29, 31, 30, 31, 30,
@@ -571,7 +592,7 @@ class UsageWidget:
         self.five_meter = tk.Canvas(header, width=28, height=10, bg=BG, bd=0, highlightthickness=0)
         self.five_meter.pack(side="left", padx=(3, 5))
         self.reset_compact = add_right_aligned_label(
-            "↻ —", "↻ 5h 59m", MUTED, reset_font, padx=(0, 8),
+            "—", "5h 59m", MUTED, reset_font, padx=(0, 8),
         )
 
         tk.Frame(header, bg="#56525F", width=1, height=18).pack(side="left", padx=(0, 5))
@@ -1101,7 +1122,7 @@ class UsageWidget:
             )
         else:
             self.five_label.configure(text="5H —%", fg=TEXT)
-            self.reset_compact.configure(text="↻ —", fg=MUTED)
+            self.reset_compact.configure(text="—", fg=MUTED)
             self._draw_segments(self.five_meter, None, None)
 
         secondary = snapshot.secondary

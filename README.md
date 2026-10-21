@@ -18,6 +18,8 @@ Codex 계정의 사용량을 확인하는 한국어 Windows 미니 위젯입니�
 
 Windows 10/11, Tkinter를 포함한 Python 3.10 이상, 로그인된 Codex 데스크톱 앱 또는 CLI가 필요합니다.
 
+나눔바른고딕을 `assets/fonts`에서 불러오므로 별도 폰트 설치는 필요하지 않으며, 프로젝트를 복사할 때 이 폴더도 함께 포함합니다.
+
 `launch_widget.bat`를 더블클릭하거나 이 폴더에서 실행합니다.
 
 ```powershell
@@ -38,3 +40,5 @@ python widget.py
 [Wannatep/codex-usage-mini-widget](https://github.com/Wannatep/codex-usage-mini-widget)을 기반으로 하며, 원본의 [The Unlicense](UNLICENSE)를 유지합니다.
 
 OpenAI의 공식 제품이 아닌 커뮤니티 프로젝트입니다.
+
+동봉한 나눔바른고딕은 [SIL Open Font License 1.1](assets/fonts/Nanum-OFL.txt)을 따르며, [출처와 저작권 안내](assets/fonts/README.md)를 함께 제공합니다.
