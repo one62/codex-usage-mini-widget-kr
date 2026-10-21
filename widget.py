@@ -28,23 +28,21 @@ from widget_settings import load_settings, save_settings
 
 
 BG = "#222127"
-PANEL = BG
-TEXT = "#FBF9FD"
-MUTED = "#B8B4C2"
+TEXT = "#FFFFFF"
+MUTED = "#C6C3CE"
 TRACK = "#424149"
-GREEN = "#8FE3B2"
-YELLOW = "#F7DB83"
-RED = "#F49A9A"
+YELLOW = "#F9E29C"
+RED = "#F6AEAE"
 GRADIENT_STOPS = (
-    (0.00, "#8FE3B2"),
-    (0.28, "#8CD9F5"),
-    (0.55, "#F7DB83"),
-    (0.78, "#F5B87D"),
-    (1.00, "#F49A9A"),
+    (0.00, "#A5E9C1"),
+    (0.28, "#A3E1F7"),
+    (0.55, "#F9E29C"),
+    (0.78, "#F7C697"),
+    (1.00, "#F6AEAE"),
 )
 WINDOW_WIDTH = 270
 WINDOW_HEIGHT = 38
-FONT_FAMILY = "NanumBarunGothic"
+FONT_FAMILY = "NEXON Football Gothic L"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "ChatGPTUsageWidget"
 RECOVERY_DELAYS = (15, 30, 60, 120, 300)
@@ -82,7 +80,7 @@ def load_bundled_fonts() -> None:
     gdi32.RemoveFontResourceExW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
     gdi32.RemoveFontResourceExW.restype = wintypes.BOOL
     private_font = 0x10  # FR_PRIVATE: available only to this process.
-    for filename in ("NanumBarunGothic.ttf", "NanumBarunGothicBold.ttf"):
+    for filename in ("NEXONFootballGothic-Light.otf", "NEXONFootballGothic-Bold.otf"):
         path = str(font_directory / filename)
         if gdi32.AddFontResourceExW(path, private_font, None):
             atexit.register(gdi32.RemoveFontResourceExW, path, private_font, None)
@@ -187,20 +185,6 @@ def weekly_reset_date(timestamp: int | None) -> str:
     return f"{reset:%m.%d.}"
 
 
-def usage_emoji(used_percent: int | None) -> str:
-    if used_percent is None:
-        return "✨"
-    if used_percent < 25:
-        return "🌱"
-    if used_percent < 50:
-        return "🫧"
-    if used_percent < 70:
-        return "🌼"
-    if used_percent < 90:
-        return "🍊"
-    return "❤️"
-
-
 def _rgb(hex_color: str) -> tuple[int, int, int]:
     value = hex_color.lstrip("#")
     return tuple(int(value[index:index + 2], 16) for index in (0, 2, 4))
@@ -283,8 +267,8 @@ class PopupMenu:
         self.on_close = on_close
         self.font = tkfont.nametofont("TkMenuFont", root=root).copy()
         self.font.configure(family=FONT_FAMILY)
-        self.background = "#202628"
-        self.active_background = "#30393B"
+        self.background = "#2A3032"
+        self.active_background = "#3A4345"
         self.window = tk.Toplevel(root)
         self.window.withdraw()
         self.window.overrideredirect(True)
@@ -523,8 +507,7 @@ class UsageWidget:
         self.root.configure(bg=BG)
         self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self.root.resizable(False, False)
-        if os.environ.get("CHATGPT_USAGE_WIDGET_VISUAL_QA") != "1":
-            self.root.overrideredirect(True)
+        self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.transparency = tk.IntVar(master=self.root, value=self.settings.transparency)
         self.movement_locked = tk.BooleanVar(master=self.root, value=self.settings.movement_locked)
@@ -563,8 +546,8 @@ class UsageWidget:
         header.pack_propagate(True)
         self.header = header
 
-        percent_font = tkfont.Font(self.root, family=FONT_FAMILY, size=8, weight="bold")
-        reset_font = tkfont.Font(self.root, family=FONT_FAMILY, size=8)
+        percent_font = tkfont.Font(self.root, family="NEXON Football Gothic B", size=9)
+        reset_font = tkfont.Font(self.root, family=FONT_FAMILY, size=9)
         weekly_dates = (
             f"{month:02d}.{day:02d}."
             for month, month_days in enumerate((31, 29, 31, 30, 31, 30,
@@ -920,13 +903,12 @@ class UsageWidget:
         except OSError:
             webbrowser.open("https://chatgpt.com/")
 
-    def _draw_segments(self, canvas: tk.Canvas, remaining_percent: int | None,
-                       used_percent: int | None) -> None:
+    def _draw_segments(self, canvas: tk.Canvas, used_percent: int | None) -> None:
         canvas.delete("all")
         count = 6
         segment_width = 3
         gap = 2
-        active = 0 if remaining_percent is None else round(count * remaining_percent / 100)
+        active = 0 if used_percent is None else round(count * used_percent / 100)
         color = MUTED if used_percent is None else usage_color(used_percent)
         for index in range(count):
             x = index * (segment_width + gap)
@@ -986,11 +968,9 @@ class UsageWidget:
                 self.recovery_after_id = None
             self.last_error = ""
             self.failure_count = 0
-            self.reset_compact.unbind("<Button-1>")
             self.snapshot = payload
             self._update_connection_status()
             self._render(payload)
-            LOGGER.info("Usage refreshed successfully")
         else:
             message = str(payload) if payload else "알 수 없는 오류"
             self._handle_connection_error(message)
@@ -1014,7 +994,6 @@ class UsageWidget:
             self.reset_compact.configure(text="retry", fg=YELLOW)
         else:
             self.reset_compact.configure(text="offline", fg=RED)
-        self.reset_compact.bind("<Button-1>", lambda _event: self.refresh())
         self._fit_content_width()
 
     def _update_connection_status(self) -> None:
@@ -1121,13 +1100,13 @@ class UsageWidget:
             self.reset_compact.configure(text=reset_short(primary.resets_at), fg=MUTED)
             self.root.after_idle(
                 lambda: self._draw_segments(
-                    self.five_meter, primary.used_percent, primary.used_percent
+                    self.five_meter, primary.used_percent
                 )
             )
         else:
             self.five_label.configure(text="5H —%", fg=TEXT)
             self.reset_compact.configure(text="—", fg=MUTED)
-            self._draw_segments(self.five_meter, None, None)
+            self._draw_segments(self.five_meter, None)
 
         secondary = snapshot.secondary
         self.week_reset.configure(
@@ -1138,12 +1117,12 @@ class UsageWidget:
             self.week_label.configure(text=f"WK {secondary.used_percent}%", fg=secondary_color)
             self.root.after_idle(
                 lambda: self._draw_segments(
-                    self.week_meter, secondary.used_percent, secondary.used_percent
+                    self.week_meter, secondary.used_percent
                 )
             )
         else:
             self.week_label.configure(text="WK —%", fg=TEXT)
-            self._draw_segments(self.week_meter, None, None)
+            self._draw_segments(self.week_meter, None)
 
         if snapshot.unlimited_credits:
             credit_text = "무제한"
