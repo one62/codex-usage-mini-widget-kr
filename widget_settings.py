@@ -1,4 +1,4 @@
-"""Persist the widget's transparency and screen position."""
+"""Persist the widget's transparency, screen position, and movement lock."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ class WidgetSettings:
     transparency: int = 30
     x: int | None = None
     y: int | None = None
+    movement_locked: bool = False
 
 
 def settings_path() -> Path:
@@ -34,6 +35,10 @@ def _validated_settings(data: object) -> WidgetSettings:
     if _integer_in_range(transparency, 0, 100):
         settings.transparency = transparency
 
+    movement_locked = data.get("movement_locked")
+    if type(movement_locked) is bool:
+        settings.movement_locked = movement_locked
+
     x, y = data.get("x"), data.get("y")
     if _integer_in_range(x, -(2**31), 2**31 - 1) and _integer_in_range(y, -(2**31), 2**31 - 1):
         settings.x, settings.y = x, y
@@ -53,9 +58,11 @@ def load_settings() -> WidgetSettings:
 def save_settings(settings: WidgetSettings) -> None:
     """Atomically replace the settings file, propagating filesystem failures."""
     settings = _validated_settings(
-        {"transparency": settings.transparency, "x": settings.x, "y": settings.y}
+        {"transparency": settings.transparency, "x": settings.x, "y": settings.y,
+         "movement_locked": settings.movement_locked}
     )
-    data = {"transparency": settings.transparency, "x": settings.x, "y": settings.y}
+    data = {"transparency": settings.transparency, "x": settings.x, "y": settings.y,
+            "movement_locked": settings.movement_locked}
     destination = settings_path()
     destination.parent.mkdir(parents=True, exist_ok=True)
 

@@ -527,6 +527,7 @@ class UsageWidget:
             self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.transparency = tk.IntVar(master=self.root, value=self.settings.transparency)
+        self.movement_locked = tk.BooleanVar(master=self.root, value=self.settings.movement_locked)
         self.root.attributes("-alpha", 1.0 - self.transparency.get() / 100)
         self.snapshot: UsageSnapshot | None = None
         self.drag_origin: tuple[int, int] | None = None
@@ -620,6 +621,8 @@ class UsageWidget:
         self.menu.add_separator()
         self.menu.add_scale(label="투명도", variable=self.transparency,
                             command=self._set_transparency)
+        self.menu.add_checkbutton(label="이동 잠금", variable=self.movement_locked,
+                                  command=self._schedule_settings_save)
         self.menu.add_separator()
         self.menu.add_checkbutton(label="항상 맨 위에 표시", variable=self.always_on_top, command=self._toggle_topmost)
         self.menu.add_checkbutton(label="Windows 시작 시 자동 실행", variable=self.autostart, command=self._toggle_autostart)
@@ -672,6 +675,7 @@ class UsageWidget:
         # Read the Scale variable directly: its command can still be pending
         # when the user closes the widget immediately after the last adjustment.
         self.settings.transparency = self.transparency.get()
+        self.settings.movement_locked = self.movement_locked.get()
         self.settings.x, self.settings.y = self.root.winfo_x(), self.root.winfo_y()
         try:
             save_settings(self.settings)
@@ -861,7 +865,7 @@ class UsageWidget:
                 dx, dy = abs(x - self._right_start[0]), abs(y - self._right_start[1])
                 if dx >= self._drag_threshold[0] or dy >= self._drag_threshold[1]:
                     self._dragged = True
-                if self._dragged:
+                if self._dragged and not self.movement_locked.get():
                     self._move_widget(x, y)
                 if action == "up":
                     self.drag_origin = None
