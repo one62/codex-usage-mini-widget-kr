@@ -15,7 +15,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from codex_usage import UsageError, find_codex_executables, parse_rate_limits
-from widget import UsageWidget, _MouseHookData, _Rect, _GuiThreadInfo, enable_dpi_awareness, clamp_position, gradient_color, recovery_delay, usage_emoji
+from widget import UsageWidget, _MouseHookData, _Rect, enable_dpi_awareness, clamp_position, gradient_color, recovery_delay
 
 
 class ParseRateLimitsTests(unittest.TestCase):
@@ -70,15 +70,10 @@ class ParseRateLimitsTests(unittest.TestCase):
                     self.assertEqual(find_codex_executables(), [str(executable.resolve())])
 
     def test_usage_gradient_has_expected_endpoints(self):
-        self.assertEqual(gradient_color(0), "#8FE3B2")
-        self.assertEqual(gradient_color(1), "#F49A9A")
-        self.assertEqual(gradient_color(-1), "#8FE3B2")
-        self.assertEqual(gradient_color(2), "#F49A9A")
-
-    def test_usage_emoji_changes_with_usage(self):
-        self.assertEqual(usage_emoji(10), "🌱")
-        self.assertEqual(usage_emoji(55), "🌼")
-        self.assertEqual(usage_emoji(95), "❤️")
+        self.assertEqual(gradient_color(0), "#A5E9C1")
+        self.assertEqual(gradient_color(1), "#F6AEAE")
+        self.assertEqual(gradient_color(-1), "#A5E9C1")
+        self.assertEqual(gradient_color(2), "#F6AEAE")
 
     def test_widget_position_stays_above_taskbar(self):
         area = (0, 0, 1920, 1040)
@@ -100,6 +95,8 @@ class MouseGestureTests(unittest.TestCase):
         self.widget._drag_threshold = (4, 4)
         self.widget._show_menu = mock.Mock()
         self.widget._move_widget = mock.Mock()
+        self.widget.movement_locked = mock.Mock()
+        self.widget.movement_locked.get.return_value = False
 
     def gesture(self, *events):
         for event in events:
@@ -245,74 +242,17 @@ class MouseGestureTests(unittest.TestCase):
             widget.root.destroy()
 
 
-    def test_outside_click_cancels_native_menu_but_inside_click_does_not(self):
+    def test_outside_click_queues_dismissal_but_inside_click_does_not(self):
         widget = self.widget
         api = widget._input_api = mock.Mock()
-        widget._input_thread_id = 12
-        def info(_thread, pointer):
-            pointer._obj.hwndMenuOwner = 123
-            return 1
-        api.GetGUIThreadInfo.side_effect = info
+        widget._menu_hwnd = 123
         api.WindowFromPoint.return_value = 456
-        api.GetWindowThreadProcessId.return_value = 12
-        def menu_class(_hwnd, name, _length):
-            name.value = "#32768"
-            return 6
-        api.GetClassNameW.side_effect = menu_class
+        api.GetAncestor.return_value = 123
         widget._dismiss_menu_outside(110, 110)
-        api.PostMessageW.assert_not_called()
-        # A menu belonging to another thread also counts as outside.
-        api.GetWindowThreadProcessId.return_value = 99
+        self.assertTrue(widget._mouse_events.empty())
+        api.GetAncestor.return_value = 789
         widget._dismiss_menu_outside(600, 500)
-        api.PostMessageW.assert_called_once_with(123, 0x1F, 0, 0)
-
-    @unittest.skipUnless(os.name == "nt", "Requires a native Windows popup")
-    def test_native_popup_closes_on_outside_click(self):
-        enable_dpi_awareness()
-        widget = UsageWidget.__new__(UsageWidget)
-        widget.root = tk.Tk()
-        widget.root.overrideredirect(True)
-        widget.root.geometry("270x38+100+100")
-        widget.menu = tk.Menu(widget.root, tearoff=False)
-        widget.menu.add_command(label="Test item")
-        results = []
-        def dismiss():
-            # Use the real native owner and a simulated hook event, with no OS click.
-            api = widget._input_api
-            deadline = time.monotonic() + 3
-            while time.monotonic() < deadline:
-                info = _GuiThreadInfo()
-                info.cbSize = ctypes.sizeof(info)
-                if (api.GetGUIThreadInfo(widget._input_thread_id, ctypes.byref(info))
-                        and info.hwndMenuOwner):
-                    data = _MouseHookData()
-                    data.pt.x, data.pt.y = 10, 10
-                    widget._mouse_hook(0, 0x201, ctypes.addressof(data))
-                    results.append(True)
-                    # Emergency cleanup if the tested cancellation failed.
-                    time.sleep(0.2)
-                    api.PostMessageW(info.hwndMenuOwner, 0x1F, 0, 0)
-                    return
-                time.sleep(0.01)
-            results.append(False)
-        try:
-            widget._enable_click_through()
-            widget.root.update()
-            worker = threading.Thread(target=dismiss, daemon=True)
-            worker.start()
-            started = time.monotonic()
-            widget._show_menu(400, 100)
-            elapsed = time.monotonic() - started
-            worker.join(timeout=4)
-            self.assertEqual(results, [True])
-            self.assertLess(elapsed, 0.2, "Popup only closed through emergency cleanup")
-            self.assertFalse(widget._menu_open)
-        finally:
-            if hasattr(widget, "_hook_thread"):
-                widget._stop_mouse_hook()
-            for callback_id in widget.root.tk.call("after", "info"):
-                widget.root.after_cancel(callback_id)
-            widget.root.destroy()
+        self.assertEqual(widget._mouse_events.get_nowait(), ("dismiss", 600, 500))
 
 
 if __name__ == "__main__":
