@@ -511,6 +511,9 @@ class UsageWidget:
         self.root.attributes("-topmost", True)
         self.transparency = tk.IntVar(master=self.root, value=self.settings.transparency)
         self.movement_locked = tk.BooleanVar(master=self.root, value=self.settings.movement_locked)
+        self.hover_transparency_enabled = tk.BooleanVar(
+            master=self.root, value=self.settings.hover_transparency_enabled)
+        self._hovered = False
         self.root.attributes("-alpha", 1.0 - self.transparency.get() / 100)
         self.snapshot: UsageSnapshot | None = None
         self.drag_origin: tuple[int, int] | None = None
@@ -531,6 +534,7 @@ class UsageWidget:
         self._bind_actions()
         self._enable_click_through()
         self._settings_ready = True
+        self._update_hover()
         self.refresh()
         self.root.after(500, self._drain_results)
         self.root.after(500, self._drain_reset_results)
@@ -604,6 +608,9 @@ class UsageWidget:
         self.menu.add_separator()
         self.menu.add_scale(label="투명도", variable=self.transparency,
                             command=self._set_transparency)
+        self.menu.add_checkbutton(label="마우스를 올리면 투명도 80%",
+                                  variable=self.hover_transparency_enabled,
+                                  command=self._toggle_hover_transparency)
         self.menu.add_checkbutton(label="이동 잠금", variable=self.movement_locked,
                                   command=self._schedule_settings_save)
         self.menu.add_separator()
@@ -659,6 +666,7 @@ class UsageWidget:
         # when the user closes the widget immediately after the last adjustment.
         self.settings.transparency = self.transparency.get()
         self.settings.movement_locked = self.movement_locked.get()
+        self.settings.hover_transparency_enabled = self.hover_transparency_enabled.get()
         self.settings.x, self.settings.y = self.root.winfo_x(), self.root.winfo_y()
         try:
             save_settings(self.settings)
@@ -883,8 +891,31 @@ class UsageWidget:
         self.root.attributes("-topmost", self.always_on_top.get())
 
     def _set_transparency(self, value: int) -> None:
-        self.root.attributes("-alpha", 1.0 - max(0, min(100, value)) / 100)
+        self._apply_transparency(value)
         self._schedule_settings_save()
+
+    def _apply_transparency(self, value: int) -> None:
+        alpha = 1.0 - max(0, min(100, value)) / 100
+        if self._hovered and self.hover_transparency_enabled.get():
+            alpha = 0.2
+        self.root.attributes("-alpha", alpha)
+
+    def _toggle_hover_transparency(self) -> None:
+        self._apply_transparency(self.transparency.get())
+        self._schedule_settings_save()
+
+    def _update_hover(self) -> None:
+        """Poll coordinates because the click-through window receives no enter events."""
+        if self._closing:
+            return
+        x, y = self.root.winfo_pointerxy()
+        left, top = self.root.winfo_rootx(), self.root.winfo_rooty()
+        hovered = (left <= x < left + self.root.winfo_width()
+                   and top <= y < top + self.root.winfo_height())
+        if hovered != self._hovered:
+            self._hovered = hovered
+            self._apply_transparency(self.transparency.get())
+        self.root.after(50, self._update_hover)
 
     def _toggle_autostart(self) -> None:
         try:

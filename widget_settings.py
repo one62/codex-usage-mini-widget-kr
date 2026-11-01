@@ -1,4 +1,4 @@
-"""Persist the widget's transparency, screen position, and movement lock."""
+"""Persist the widget's appearance, screen position, and movement lock."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ class WidgetSettings:
     x: int | None = None
     y: int | None = None
     movement_locked: bool = False
+    hover_transparency_enabled: bool = True
 
 
 def settings_path() -> Path:
@@ -39,6 +40,10 @@ def _validated_settings(data: object) -> WidgetSettings:
     if type(movement_locked) is bool:
         settings.movement_locked = movement_locked
 
+    hover_transparency_enabled = data.get("hover_transparency_enabled")
+    if type(hover_transparency_enabled) is bool:
+        settings.hover_transparency_enabled = hover_transparency_enabled
+
     x, y = data.get("x"), data.get("y")
     if _integer_in_range(x, -(2**31), 2**31 - 1) and _integer_in_range(y, -(2**31), 2**31 - 1):
         settings.x, settings.y = x, y
@@ -59,10 +64,12 @@ def save_settings(settings: WidgetSettings) -> None:
     """Atomically replace the settings file, propagating filesystem failures."""
     settings = _validated_settings(
         {"transparency": settings.transparency, "x": settings.x, "y": settings.y,
-         "movement_locked": settings.movement_locked}
+         "movement_locked": settings.movement_locked,
+         "hover_transparency_enabled": settings.hover_transparency_enabled}
     )
     data = {"transparency": settings.transparency, "x": settings.x, "y": settings.y,
-            "movement_locked": settings.movement_locked}
+            "movement_locked": settings.movement_locked,
+            "hover_transparency_enabled": settings.hover_transparency_enabled}
     destination = settings_path()
     destination.parent.mkdir(parents=True, exist_ok=True)
 
