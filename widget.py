@@ -1179,7 +1179,33 @@ class UsageWidget:
         self.root.mainloop()
 
 
-if __name__ == "__main__":
+def main() -> None:
     if os.name != "nt":
         raise SystemExit("이 위젯은 Windows에서만 실행할 수 있습니다.")
-    UsageWidget().run()
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel.CreateMutexW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+
+    error_already_exists = 183
+    ctypes.set_last_error(0)
+    mutex = kernel.CreateMutexW(None, False, r"Local\CodexUsageMiniWidget")
+    error = ctypes.get_last_error()
+    if not mutex:
+        raise ctypes.WinError(error)
+
+    if error == error_already_exists:
+        kernel.CloseHandle(mutex)
+        messagebox.showinfo("Codex 사용량 위젯", "위젯이 이미 실행 중입니다.")
+        return
+
+    try:
+        UsageWidget().run()
+    finally:
+        kernel.CloseHandle(mutex)
+
+
+if __name__ == "__main__":
+    main()
