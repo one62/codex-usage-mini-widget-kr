@@ -15,8 +15,6 @@ import winreg
 import uuid
 import ctypes
 from ctypes import wintypes
-import logging
-from logging.handlers import RotatingFileHandler
 from decimal import Decimal
 from datetime import datetime
 from pathlib import Path
@@ -24,7 +22,25 @@ from tkinter import messagebox
 from tkinter import font as tkfont
 
 from codex_usage import UsageSnapshot, consume_reset_credit, find_codex_executables, query_usage
-from widget_settings import load_settings, save_settings
+from widget_settings import (
+    PendingReset, load_pending_reset, load_settings, save_pending_reset, save_settings,
+)
+
+try:
+    from diagnostics.error_log import record_error
+except ModuleNotFoundError as exc:
+    if exc.name not in ("diagnostics", "diagnostics.error_log"):
+        raise
+
+    def record_error(event: str) -> None:
+        pass
+
+try:
+    from diagnostics.topmost import TopmostDiagnostics
+except ModuleNotFoundError as exc:
+    if exc.name not in ("diagnostics", "diagnostics.topmost"):
+        raise
+    TopmostDiagnostics = None
 
 
 BG = "#222127"
@@ -48,30 +64,6 @@ RUN_VALUE = "ChatGPTUsageWidget"
 RECOVERY_DELAYS = (15, 30, 60, 120, 300)
 
 
-def diagnostic_log_path() -> Path:
-    base = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "CodexUsageMini"
-    return base / "widget.log"
-
-
-def _configure_logger() -> logging.Logger:
-    logger = logging.getLogger("codex-usage-mini-widget")
-    if logger.handlers:
-        return logger
-    logger.setLevel(logging.INFO)
-    try:
-        path = diagnostic_log_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handler = RotatingFileHandler(path, maxBytes=262_144, backupCount=2, encoding="utf-8")
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-        logger.addHandler(handler)
-    except OSError:
-        logger.addHandler(logging.NullHandler())
-    return logger
-
-
-LOGGER = _configure_logger()
-
-
 def load_bundled_fonts() -> None:
     font_directory = Path(__file__).resolve().parent / "assets" / "fonts"
     gdi32 = ctypes.WinDLL("gdi32")
@@ -85,7 +77,7 @@ def load_bundled_fonts() -> None:
         if gdi32.AddFontResourceExW(path, private_font, None):
             atexit.register(gdi32.RemoveFontResourceExW, path, private_font, None)
         else:
-            LOGGER.warning("Could not load bundled font: %s", path)
+            record_error("bundled_font_load_failed")
 
 
 def recovery_delay(failure_count: int) -> int:
@@ -296,9 +288,11 @@ class PopupMenu:
         index = len(self.entries)
         row = tk.Frame(self.body, bg=self.background, bd=0)
         row.pack(fill="x")
-        indicator = tk.Canvas(row, width=18, height=18, bg=self.background,
-                              bd=0, highlightthickness=0)
-        indicator.pack(side="left", padx=(12, 6))
+        indicator = None
+        if kind == "check":
+            indicator = tk.Canvas(row, width=18, height=18, bg=self.background,
+                                  bd=0, highlightthickness=0)
+            indicator.pack(side="left", padx=(12, 6))
         right_widget = None
         if right_text is not None:
             right_widget = tk.Label(row, anchor="e", padx=0, pady=6,
@@ -306,16 +300,18 @@ class PopupMenu:
             right_widget.pack(side="right", padx=(0, 12))
         text_widget = tk.Label(row, anchor="w", padx=0, pady=6,
                                bg=self.background, bd=0, font=self.font)
-        text_widget.pack(side="left", fill="both", expand=True, padx=(0, 12))
+        text_widget.pack(side="left", fill="both", expand=True,
+                         padx=(0 if indicator else 12, 12))
         self.entries.append(dict(kind=kind, label=label, state=state,
                                  command=command, variable=variable, widget=row,
                                  text_widget=text_widget, indicator=indicator,
                                  right_widget=right_widget, right_text=right_text))
         if kind != "info":
             for target in (row, indicator, text_widget):
-                target.bind("<Enter>", lambda event, i=index: self._select(i))
-                target.bind("<Leave>", lambda event: self._select(None))
-                target.bind("<ButtonRelease-1>", lambda event, i=index: self._invoke(i))
+                if target is not None:
+                    target.bind("<Enter>", lambda event, i=index: self._select(i))
+                    target.bind("<Leave>", lambda event: self._select(None))
+                    target.bind("<ButtonRelease-1>", lambda event, i=index: self._invoke(i))
         # Information labels have no mouse, keyboard, or command bindings.
         self._render_row(index)
 
@@ -418,14 +414,15 @@ class PopupMenu:
         foreground = TEXT if enabled else MUTED
         background = self.active_background if enabled and self.selected == index else self.background
         for target in (entry["widget"], entry["text_widget"], entry["indicator"]):
-            target.configure(bg=background, cursor="hand2" if enabled else "arrow")
+            if target is not None:
+                target.configure(bg=background, cursor="hand2" if enabled else "arrow")
         entry["text_widget"].configure(text=entry["label"], fg=foreground)
         if entry["right_widget"] is not None:
             entry["right_widget"].configure(text=entry["right_text"], fg=foreground,
                                             bg=background)
         indicator = entry["indicator"]
-        indicator.delete("all")
-        if entry["kind"] == "check":
+        if indicator is not None:
+            indicator.delete("all")
             # Draw the check instead of depending on a font's Unicode glyph.
             indicator.create_rectangle(2, 2, 15, 15, outline=foreground)
             if entry["variable"].get():
@@ -512,6 +509,7 @@ class UsageWidget:
         self._settings_after_id: str | None = None
         self._settings_ready = False
         self._closing = False
+        self._diagnostics = None
         self.root = tk.Tk()
         self.root.title("ChatGPT Usage")
         self.root.configure(bg=BG)
@@ -530,12 +528,18 @@ class UsageWidget:
         self.results: queue.Queue[tuple[int, str, object]] = queue.Queue()
         self.refreshing = False
         self.resetting = False
-        self.reset_request_key: str | None = None
+        self.reset_state_unreadable = False
+        try:
+            self.pending_reset = load_pending_reset()
+        except (OSError, ValueError, RecursionError):
+            self.pending_reset = None
+            self.reset_state_unreadable = True
+            record_error("pending_reset_load_failed")
         self.reset_results: queue.Queue[tuple[str, object]] = queue.Queue()
         self.fetch_generation = 0
         self.failure_count = 0
         self.recovery_after_id: str | None = None
-        self.last_error = ""
+        self.connection_failed = False
         self.always_on_top = tk.BooleanVar(value=True)
         self.autostart = tk.BooleanVar(value=autostart_enabled())
         self._build()
@@ -543,6 +547,9 @@ class UsageWidget:
         self._apply_rounded_corners()
         self._bind_actions()
         self._enable_click_through()
+        if TopmostDiagnostics is not None:
+            self._diagnostics = TopmostDiagnostics(self)
+            self._diagnostics.check()
         self._settings_ready = True
         self._update_hover()
         self.refresh()
@@ -565,7 +572,7 @@ class UsageWidget:
             self.codex_logo = tk.PhotoImage(master=self.root, file=str(logo_path))
             tk.Label(header, image=self.codex_logo, bg=BG, bd=0).pack(side="left", padx=(2, 4))
         except tk.TclError:
-            LOGGER.warning("Could not load Codex logo: %s", logo_path)
+            record_error("codex_logo_load_failed")
 
         percent_font = tkfont.Font(self.root, family="NEXON Football Gothic B", size=9)
         reset_font = tkfont.Font(self.root, family=FONT_FAMILY, size=9)
@@ -616,8 +623,10 @@ class UsageWidget:
         self.menu.add_info(label="연결 상태: 확인 전")
         self.connection_status_index = self.menu.index("end")
         self.menu.add_separator()
-        self.menu.add_info(label="크레딧: —")
-        self.credit_index = self.menu.index("end")
+        self.menu.add_info(label="계정: —")
+        self.account_index = self.menu.index("end")
+        self.menu.add_info(label="요금제: —", right_text="크레딧: —")
+        self.plan_index = self.menu.index("end")
         self.menu.add_info(label="사용량 리셋권: —", right_text="")
         self.reset_count_index = self.menu.index("end")
         self.menu.add_command(label="리셋권 사용하기", state="disabled", command=self._use_reset_credit)
@@ -687,8 +696,8 @@ class UsageWidget:
         self.settings.x, self.settings.y = self.root.winfo_x(), self.root.winfo_y()
         try:
             save_settings(self.settings)
-        except OSError as exc:
-            LOGGER.warning("Could not save widget settings: %s", exc)
+        except OSError:
+            record_error("settings_save_failed")
 
     def _close(self) -> None:
         if self._closing:
@@ -813,7 +822,7 @@ class UsageWidget:
                     break
         except Exception as exc:
             self._hook_error = exc
-            LOGGER.error("Mouse hook failed: %s", exc)
+            record_error("mouse_hook_failed")
         finally:
             if self._mouse_hook_handle:
                 api.UnhookWindowsHookEx(self._mouse_hook_handle)
@@ -835,7 +844,7 @@ class UsageWidget:
                 if message in (0x201, 0x204, 0x207, 0x20B):
                     self._dismiss_menu_outside(x, y)
                 return self._input_api.CallNextHookEx(None, code, message, data)
-            if message == 0x204 and not self._menu_open:  # WM_RBUTTONDOWN
+            if message == 0x204:  # WM_RBUTTONDOWN
                 rect = _Rect()
                 if (self._input_api.IsWindowVisible(self._input_hwnd)
                         and self._input_api.GetWindowRect(self._input_hwnd, ctypes.byref(rect))
@@ -891,12 +900,16 @@ class UsageWidget:
         self.root.geometry(f"+{x}+{y}")
 
     def _show_menu(self, x: int, y: int) -> None:
+        if self._diagnostics is not None:
+            self._diagnostics.log.info("Topmost action: menu opening")
         self._update_connection_status()
         self.menu.show(x, y)
         self._menu_hwnd = self._input_api.GetAncestor(self.menu.window.winfo_id(), 2)
         self._menu_open = True
 
     def _menu_closed(self) -> None:
+        if self._diagnostics is not None:
+            self._diagnostics.log.info("Topmost action: menu closed")
         self._menu_open = False
         self._menu_hwnd = None
 
@@ -905,6 +918,8 @@ class UsageWidget:
             self._stop_mouse_hook()
 
     def _toggle_topmost(self) -> None:
+        if self._diagnostics is not None:
+            self._diagnostics.log.info("Topmost action: option=%s", self.always_on_top.get())
         self.root.attributes("-topmost", self.always_on_top.get())
 
     def _set_transparency(self, value: int) -> None:
@@ -915,6 +930,8 @@ class UsageWidget:
         alpha = 1.0 - max(0, min(100, value)) / 100
         if self._hovered and self.hover_transparency_enabled.get():
             alpha = 0.2
+        if self._diagnostics is not None:
+            self._diagnostics.log.info("Topmost action: alpha=%s hovered=%s", alpha, self._hovered)
         self.root.attributes("-alpha", alpha)
 
     def _toggle_hover_transparency(self) -> None:
@@ -978,18 +995,15 @@ class UsageWidget:
         self.root.after(50_000, lambda: self._fetch_watchdog(generation))
 
     def _fetch_worker(self, generation: int) -> None:
-        last_error: Exception | None = None
         for delay in (0.0, 2.0):
             if delay:
                 time.sleep(delay)
             try:
                 self.results.put((generation, "ok", query_usage(timeout=18.0)))
                 return
-            except Exception as exc:
-                last_error = exc
-        self.results.put(
-            (generation, "error", last_error or RuntimeError("알 수 없는 오류"))
-        )
+            except Exception:
+                continue
+        self.results.put((generation, "error", None))
 
     def _fetch_watchdog(self, generation: int) -> None:
         if not self.refreshing or generation != self.fetch_generation:
@@ -997,7 +1011,7 @@ class UsageWidget:
         self.fetch_generation += 1  # Ignore a late result from the stuck worker.
         self.refreshing = False
         self.menu.entryconfigure(0, state="normal")
-        self._handle_connection_error("사용량 조회가 50초를 초과했습니다.")
+        self._handle_connection_error()
 
     def _drain_results(self) -> None:
         try:
@@ -1014,29 +1028,28 @@ class UsageWidget:
             if self.recovery_after_id is not None:
                 self.root.after_cancel(self.recovery_after_id)
                 self.recovery_after_id = None
-            self.last_error = ""
+            self.connection_failed = False
             self.failure_count = 0
             self.snapshot = payload
             self._update_connection_status()
             self._render(payload)
         else:
-            message = str(payload) if payload else "알 수 없는 오류"
-            self._handle_connection_error(message)
+            self._handle_connection_error()
         self.root.after(500, self._drain_results)
 
-    def _handle_connection_error(self, message: str) -> None:
-        self.last_error = message
+    def _handle_connection_error(self) -> None:
+        self.connection_failed = True
         self._update_connection_status()
         self._update_reset_menu()
         self.failure_count += 1
-        LOGGER.warning("Refresh failed (%s): %s", self.failure_count, message)
+        record_error("usage_refresh_failed")
         self._render_connection_issue()
         if self.recovery_after_id is None:
             delay = recovery_delay(self.failure_count)
             self.recovery_after_id = self.root.after(delay * 1000, self._recovery_refresh)
 
     def _render_connection_issue(self) -> None:
-        if not self.last_error:
+        if not self.connection_failed:
             return
         if self.snapshot is not None and self.failure_count < 3:
             self.reset_compact.configure(text="retry", fg=YELLOW)
@@ -1048,7 +1061,7 @@ class UsageWidget:
         """Display cached query state without starting a connection check."""
         if self.refreshing:
             status = "조회 중"
-        elif self.last_error:
+        elif self.connection_failed:
             status = "재연결 중"
         elif self.snapshot is not None:
             status = "정상"
@@ -1075,26 +1088,37 @@ class UsageWidget:
             label=f"사용량 리셋권: {count}개" if count is not None else "사용량 리셋권: 조회 불가",
             right_text=expiry,
         )
-        retry = self.reset_request_key is not None
-        enabled = (not self.resetting and not self.refreshing
-                   and (retry or (not self.last_error and count is not None and count > 0)))
+        retry = self.pending_reset is not None
+        can_start = (not self.connection_failed and self.snapshot is not None
+                     and self.snapshot.reset_credit_id is not None
+                     and self.snapshot.executable is not None)
+        enabled = (not self.resetting and not self.refreshing and not self.reset_state_unreadable
+                   and (retry or can_start))
         label = "리셋권 사용 결과 재확인" if retry else "리셋권 사용하기"
         if self.resetting:
             label = "리셋권 사용 처리 중…"
+        elif self.reset_state_unreadable:
+            label = "리셋권 사용 불가 (요청 기록 확인 필요)"
+        elif count and not retry and not can_start and not self.connection_failed:
+            label = "리셋권 사용 불가 (대상 확인 필요)"
         self.menu.entryconfigure(self.reset_use_index, label=label,
                                  state="normal" if enabled else "disabled")
 
     def _use_reset_credit(self) -> None:
-        if self.resetting or self.refreshing:
+        if self.resetting or self.refreshing or self.reset_state_unreadable:
             return
-        retry = self.reset_request_key is not None
-        if not retry and (self.last_error or self.snapshot is None
-                          or not self.snapshot.reset_credit_count):
-            return
+        request = self.pending_reset
+        snapshot = self.snapshot
+        if request is None:
+            if (self.connection_failed or snapshot is None or not snapshot.reset_credit_id
+                    or not snapshot.executable):
+                return
+            request = PendingReset(str(uuid.uuid4()), snapshot.executable, snapshot.reset_credit_id)
+        retry = self.pending_reset is not None
         prompt = (
             "이전 리셋권 사용 요청의 결과를 같은 요청 키로 다시 확인합니다.\n계속하시겠습니까?"
             if retry else
-            "사용량 리셋권 1개를 사용하시겠습니까?\n\n"
+            "사용량 리셋권 1개를 사용하시겠습니까? 만료가 있는 권리부터 사용합니다.\n\n"
             "초기화 대상 기간은 서버가 결정하며, 주간 사용량만 지정할 수는 없습니다."
         )
         if not messagebox.askyesno("사용량 리셋권", prompt, parent=self.root):
@@ -1103,22 +1127,31 @@ class UsageWidget:
         if self.resetting or self.refreshing:
             messagebox.showinfo("사용량 리셋권", "조회가 끝난 뒤 다시 선택해 주세요.", parent=self.root)
             return
-        if not retry and (self.last_error or self.snapshot is None
-                          or not self.snapshot.reset_credit_count):
+        if not retry and (self.connection_failed or self.snapshot is not snapshot
+                          or self.pending_reset is not None):
             return
-        if self.reset_request_key is None:
-            self.reset_request_key = str(uuid.uuid4())
+        if not retry:
+            try:
+                save_pending_reset(request)
+            except OSError:
+                record_error("pending_reset_save_failed")
+                messagebox.showwarning("사용량 리셋권", "요청 기록을 저장하지 못했습니다.", parent=self.root)
+                return
+            self.pending_reset = request
+        elif self.pending_reset != request:
+            return
         self.resetting = True
         self.menu.entryconfigure(0, state="disabled")
         self._update_reset_menu()
         threading.Thread(target=self._reset_worker,
-                         args=(self.reset_request_key,), daemon=True).start()
+                         args=(request,), daemon=True).start()
 
-    def _reset_worker(self, request_key: str) -> None:
+    def _reset_worker(self, request: PendingReset) -> None:
         try:
-            self.reset_results.put(("ok", consume_reset_credit(request_key)))
-        except Exception as exc:
-            self.reset_results.put(("error", str(exc)))
+            self.reset_results.put(("ok", consume_reset_credit(request.key, request.executable, request.credit_id)))
+        except Exception:
+            record_error("reset_request_failed")
+            self.reset_results.put(("error", ""))
 
     def _drain_reset_results(self) -> None:
         try:
@@ -1129,7 +1162,12 @@ class UsageWidget:
         self.resetting = False
         self.menu.entryconfigure(0, state="normal")
         if kind == "ok":
-            self.reset_request_key = None
+            try:
+                save_pending_reset(None)
+            except OSError:
+                record_error("pending_reset_clear_failed")
+            else:
+                self.pending_reset = None
             messages = {
                 "reset": "리셋권 1개를 사용했습니다. 사용량과 남은 개수를 다시 조회합니다.",
                 "alreadyRedeemed": "이 요청은 이미 처리되었습니다. 사용량과 남은 개수를 다시 조회합니다.",
@@ -1142,9 +1180,8 @@ class UsageWidget:
             self._update_reset_menu()
             messagebox.showwarning(
                 "사용량 리셋권",
-                f"리셋권 사용 결과를 확인하지 못했습니다.\n{payload}\n\n"
-                "위젯을 종료하지 말고 ‘리셋권 사용 결과 재확인’을 선택해 주세요.\n"
-                "같은 요청 키를 사용하여 중복 사용을 방지합니다.",
+                "리셋권 사용 결과를 확인하지 못했습니다.\n\n"
+                "‘리셋권 사용 결과 재확인’에서 같은 리셋권과 요청 키로 확인할 수 있습니다.",
                 parent=self.root,
             )
         self.root.after(500, self._drain_reset_results)
@@ -1181,13 +1218,16 @@ class UsageWidget:
             self.week_label.configure(text="WK —%", fg=TEXT)
             self._draw_segments(self.week_meter, None)
 
+        self.menu.entryconfigure(self.account_index, label=f"계정: {snapshot.account or '—'}")
+        plan_text = snapshot.plan if snapshot.plan.lower() != "unknown" else "—"
         if snapshot.unlimited_credits:
             credit_text = "무제한"
         elif snapshot.credit_balance is not None:
             credit_text = f"{snapshot.credit_balance.quantize(Decimal('0.01'))}"
         else:
             credit_text = "—"
-        self.menu.entryconfigure(self.credit_index, label=f"크레딧: {credit_text}")
+        self.menu.entryconfigure(self.plan_index, label=f"요금제: {plan_text}",
+                                 right_text=f"크레딧: {credit_text}")
         self._update_reset_menu()
         self._fit_content_width()
 

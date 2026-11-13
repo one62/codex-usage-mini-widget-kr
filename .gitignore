@@ -10,3 +10,5 @@ dist/
 .env.*
 .idea/
 .vscode/
+
+/diagnostics/

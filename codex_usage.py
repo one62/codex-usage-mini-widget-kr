@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -17,6 +17,10 @@ from typing import Any
 
 class UsageError(RuntimeError):
     """Raised when the local Codex app server cannot return usage data."""
+
+
+class _UsageAuthError(UsageError):
+    """An app-server error that can be retried after refreshing auth."""
 
 
 @dataclass(frozen=True)
@@ -37,10 +41,11 @@ class UsageSnapshot:
     secondary: UsageWindow | None
     credit_balance: Decimal | None
     unlimited_credits: bool
-    reached_type: str | None
-    fetched_at: float
     reset_credit_count: int | None = None
     reset_credit_expires_at: int | None = None
+    account: str | None = None
+    reset_credit_id: str | None = None
+    executable: str | None = None
 
 
 def _window(value: Any) -> UsageWindow | None:
@@ -109,6 +114,7 @@ def parse_rate_limits(result: dict[str, Any]) -> UsageSnapshot:
     reset_credits = result.get("rateLimitResetCredits")
     reset_credit_count = None
     reset_credit_expires_at = None
+    reset_credit_id = None
     if isinstance(reset_credits, dict):
         count = reset_credits.get("availableCount")
         if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
@@ -118,11 +124,17 @@ def parse_rate_limits(result: dict[str, Any]) -> UsageSnapshot:
                 available = [credit for credit in details
                              if isinstance(credit, dict) and credit.get("status") == "available"]
                 if len(available) == count and all(
-                    isinstance(credit.get("expiresAt"), int)
-                    and not isinstance(credit.get("expiresAt"), bool)
+                    "expiresAt" in credit
+                    and (credit["expiresAt"] is None or type(credit["expiresAt"]) is int)
                     for credit in available
                 ):
-                    reset_credit_expires_at = min(credit["expiresAt"] for credit in available)
+                    earliest = min(available, key=lambda credit: (
+                        credit["expiresAt"] is None, credit["expiresAt"] or 0
+                    ))
+                    reset_credit_expires_at = earliest["expiresAt"]
+                    credit_id = earliest.get("id")
+                    if isinstance(credit_id, str) and credit_id.strip():
+                        reset_credit_id = credit_id
 
     return UsageSnapshot(
         plan=str(rate_limits.get("planType") or result.get("planType") or "unknown"),
@@ -130,10 +142,9 @@ def parse_rate_limits(result: dict[str, Any]) -> UsageSnapshot:
         secondary=secondary,
         credit_balance=balance,
         unlimited_credits=unlimited,
-        reached_type=rate_limits.get("rateLimitReachedType"),
-        fetched_at=time.time(),
         reset_credit_count=reset_credit_count,
         reset_credit_expires_at=reset_credit_expires_at,
+        reset_credit_id=reset_credit_id,
     )
 
 
@@ -177,13 +188,16 @@ def _wait_for_id(reader: _LineReader, request_id: int, deadline: float) -> dict[
             message = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        if message.get("id") != request_id:
+        if not isinstance(message, dict) or message.get("id") != request_id:
             continue
         if "error" in message:
             detail = message["error"]
             if isinstance(detail, dict):
                 detail = detail.get("message") or detail
-            raise UsageError(f"Codex가 오류를 반환했습니다: {detail}")
+            error_text = str(detail).lower()
+            if any(word in error_text for word in ("auth", "token", "401", "unauthor")):
+                raise _UsageAuthError("Codex 인증을 확인할 수 없습니다.")
+            raise UsageError("Codex App Server가 요청을 처리하지 못했습니다.")
         result = message.get("result")
         if not isinstance(result, dict):
             raise UsageError("Codex 응답 형식이 올바르지 않습니다.")
@@ -233,7 +247,10 @@ def find_codex_executables() -> list[str]:
     seen: set[str] = set()
     for candidate in candidates:
         try:
-            resolved = str(candidate.resolve(strict=True))
+            path = candidate.resolve(strict=True)
+            if not path.is_file():
+                continue
+            resolved = str(path)
         except OSError:
             continue
         key = os.path.normcase(resolved)
@@ -244,9 +261,11 @@ def find_codex_executables() -> list[str]:
 
 
 def _query_with_executable(executable: str, timeout: float,
-                           reset_key: str | None = None) -> UsageSnapshot | str:
+                           reset_key: str | None = None,
+                           credit_id: str | None = None) -> UsageSnapshot | str:
     """Read limits or redeem a reset through one concrete Codex executable."""
 
+    deadline = time.monotonic() + timeout
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         process = subprocess.Popen(
@@ -261,13 +280,12 @@ def _query_with_executable(executable: str, timeout: float,
             creationflags=creation_flags,
         )
     except OSError as exc:
-        raise UsageError(f"Codex App Server를 실행하지 못했습니다: {exc}") from exc
+        raise UsageError("Codex App Server를 실행하지 못했습니다.") from exc
     if process.stdout is None:
         process.kill()
         raise UsageError("Codex 응답을 읽기 위한 통신 채널을 열지 못했습니다.")
 
     reader = _LineReader(process.stdout)
-    deadline = time.monotonic() + timeout
     try:
         _send(
             process,
@@ -283,10 +301,12 @@ def _query_with_executable(executable: str, timeout: float,
         _wait_for_id(reader, 1, deadline)
         _send(process, {"method": "initialized"})
         if reset_key is not None:
+            if time.monotonic() >= deadline:
+                raise UsageError("리셋권 요청 시간이 초과되었습니다.")
             _send(process, {
                 "id": 2,
                 "method": "account/rateLimitResetCredit/consume",
-                "params": {"idempotencyKey": reset_key},
+                "params": {"idempotencyKey": reset_key, "creditId": credit_id},
             })
             result = _wait_for_id(reader, 2, deadline)
             outcome = result.get("outcome")
@@ -296,10 +316,7 @@ def _query_with_executable(executable: str, timeout: float,
         _send(process, {"id": 2, "method": "account/rateLimits/read"})
         try:
             result = _wait_for_id(reader, 2, deadline)
-        except UsageError as exc:
-            error_text = str(exc).lower()
-            if not any(word in error_text for word in ("auth", "token", "401", "unauthor")):
-                raise
+        except _UsageAuthError:
             _send(
                 process,
                 {"id": 3, "method": "account/read", "params": {"refreshToken": True}},
@@ -307,9 +324,31 @@ def _query_with_executable(executable: str, timeout: float,
             _wait_for_id(reader, 3, deadline)
             _send(process, {"id": 4, "method": "account/rateLimits/read"})
             result = _wait_for_id(reader, 4, deadline)
-        return parse_rate_limits(result)
+        snapshot = parse_rate_limits(result)
+        # Account details are optional: a missing or slow response must not hide usage.
+        try:
+            if time.monotonic() < deadline:
+                _send(process, {"id": 5, "method": "account/read", "params": {"refreshToken": False}})
+                account_result = _wait_for_id(reader, 5, min(deadline, time.monotonic() + 2.0))
+                account = account_result.get("account")
+                if isinstance(account, dict):
+                    account_type = account.get("type")
+                    email = account.get("email")
+                    account_label = email.strip() if isinstance(email, str) and email.strip() else None
+                    if account_label is None and account_type == "apiKey":
+                        account_label = "API 키"
+                    elif account_label is None and account_type == "amazonBedrock":
+                        account_label = "Amazon Bedrock"
+                    account_plan = account.get("planType")
+                    plan = snapshot.plan
+                    if plan.lower() == "unknown" and isinstance(account_plan, str) and account_plan.strip():
+                        plan = account_plan.strip()
+                    snapshot = replace(snapshot, account=account_label, plan=plan)
+        except (UsageError, OSError):
+            pass
+        return snapshot
     except OSError as exc:
-        raise UsageError(f"Codex 호출에 실패했습니다: {exc}") from exc
+        raise UsageError("Codex App Server와 통신하지 못했습니다.") from exc
     finally:
         if process.poll() is None:
             process.terminate()
@@ -325,17 +364,21 @@ def _query_with_executable(executable: str, timeout: float,
 
 def query_usage(timeout: float = 15.0) -> UsageSnapshot:
     """Fetch a snapshot, falling back across current and newly installed Codex builds."""
+    deadline = time.monotonic() + timeout
     executables = find_codex_executables()
     if not executables:
         raise UsageError("Codex 실행 파일을 찾을 수 없습니다. Codex Desktop을 실행하거나 설치한 뒤 다시 시도해 주세요.")
 
     errors: list[str] = []
     for executable in executables:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            snapshot = _query_with_executable(executable, timeout)
+            snapshot = _query_with_executable(executable, remaining)
             if not isinstance(snapshot, UsageSnapshot):
                 raise UsageError("Codex 사용량 응답 형식이 올바르지 않습니다.")
-            return snapshot
+            return replace(snapshot, executable=executable)
         except UsageError as exc:
             errors.append(str(exc))
 
@@ -343,15 +386,16 @@ def query_usage(timeout: float = 15.0) -> UsageSnapshot:
     raise UsageError(f"Codex에 연결하지 못했습니다: {detail}")
 
 
-def consume_reset_credit(idempotency_key: str, timeout: float = 18.0) -> str:
+def consume_reset_credit(idempotency_key: str, executable: str, credit_id: str,
+                         timeout: float = 18.0) -> str:
     """Redeem once; callers retain the same key after an uncertain result."""
-    if not idempotency_key:
-        raise ValueError("리셋권 사용 요청 키가 필요합니다.")
-    executables = find_codex_executables()
-    if not executables:
-        raise UsageError("Codex 실행 파일을 찾을 수 없습니다.")
+    if not all((idempotency_key, executable, credit_id)):
+        raise ValueError("리셋권 요청 정보가 누락되었습니다.")
+    if executable not in find_codex_executables():
+        raise UsageError("리셋권을 조회한 Codex 실행 파일을 찾을 수 없습니다.")
     # Never fall back or automatically retry a mutation after a transport error.
-    outcome = _query_with_executable(executables[0], timeout, reset_key=idempotency_key)
+    outcome = _query_with_executable(executable, timeout, reset_key=idempotency_key,
+                                     credit_id=credit_id)
     if not isinstance(outcome, str):
         raise UsageError("리셋권 사용 결과 형식이 올바르지 않습니다.")
     return outcome

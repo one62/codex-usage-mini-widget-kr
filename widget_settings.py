@@ -18,6 +18,13 @@ class WidgetSettings:
     hover_transparency_enabled: bool = True
 
 
+@dataclass(frozen=True)
+class PendingReset:
+    key: str
+    executable: str
+    credit_id: str
+
+
 def settings_path() -> Path:
     return Path(os.environ.get("LOCALAPPDATA", Path.home())) / "CodexUsageMini" / "settings.json"
 
@@ -70,7 +77,34 @@ def save_settings(settings: WidgetSettings) -> None:
     data = {"transparency": settings.transparency, "x": settings.x, "y": settings.y,
             "movement_locked": settings.movement_locked,
             "hover_transparency_enabled": settings.hover_transparency_enabled}
-    destination = settings_path()
+    _write_json(settings_path(), data)
+
+
+def load_pending_reset() -> PendingReset | None:
+    path = settings_path().with_name("pending-reset.json")
+    try:
+        with path.open("r", encoding="utf-8") as source:
+            data = json.load(source)
+    except FileNotFoundError:
+        return None
+    if not isinstance(data, dict):
+        raise ValueError("Invalid pending reset")
+    key, executable, credit_id = (data.get(name) for name in ("key", "executable", "credit_id"))
+    if not all(isinstance(value, str) and value.strip() for value in (key, executable, credit_id)):
+        raise ValueError("Invalid pending reset")
+    return PendingReset(key, executable, credit_id)
+
+
+def save_pending_reset(request: PendingReset | None) -> None:
+    path = settings_path().with_name("pending-reset.json")
+    if request is None:
+        path.unlink(missing_ok=True)
+    else:
+        _write_json(path, {"key": request.key, "executable": request.executable,
+                           "credit_id": request.credit_id})
+
+
+def _write_json(destination: Path, data: dict) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     temporary: Path | None = None
