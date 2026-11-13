@@ -550,6 +550,13 @@ class UsageWidget:
         header.pack_propagate(True)
         self.header = header
 
+        logo_path = Path(__file__).resolve().parent / "assets" / "codex-logo.png"
+        try:
+            self.codex_logo = tk.PhotoImage(master=self.root, file=str(logo_path))
+            tk.Label(header, image=self.codex_logo, bg=BG, bd=0).pack(side="left", padx=(2, 4))
+        except tk.TclError:
+            LOGGER.warning("Could not load Codex logo: %s", logo_path)
+
         percent_font = tkfont.Font(self.root, family="NEXON Football Gothic B", size=9)
         reset_font = tkfont.Font(self.root, family=FONT_FAMILY, size=9)
         weekly_dates = (
