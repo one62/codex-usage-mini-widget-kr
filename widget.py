@@ -291,19 +291,26 @@ class PopupMenu:
         self.window.bind("<FocusOut>", self._focus_out)
 
     def _add_row(self, kind: str, label: str, state: str = "normal",
-                 command=None, variable: tk.BooleanVar | None = None) -> None:
+                 command=None, variable: tk.BooleanVar | None = None,
+                 right_text: str | None = None) -> None:
         index = len(self.entries)
         row = tk.Frame(self.body, bg=self.background, bd=0)
         row.pack(fill="x")
         indicator = tk.Canvas(row, width=18, height=18, bg=self.background,
                               bd=0, highlightthickness=0)
         indicator.pack(side="left", padx=(12, 6))
+        right_widget = None
+        if right_text is not None:
+            right_widget = tk.Label(row, anchor="e", padx=0, pady=6,
+                                    bg=self.background, bd=0, font=self.font)
+            right_widget.pack(side="right", padx=(0, 12))
         text_widget = tk.Label(row, anchor="w", padx=0, pady=6,
                                bg=self.background, bd=0, font=self.font)
         text_widget.pack(side="left", fill="both", expand=True, padx=(0, 12))
         self.entries.append(dict(kind=kind, label=label, state=state,
                                  command=command, variable=variable, widget=row,
-                                 text_widget=text_widget, indicator=indicator))
+                                 text_widget=text_widget, indicator=indicator,
+                                 right_widget=right_widget, right_text=right_text))
         if kind != "info":
             for target in (row, indicator, text_widget):
                 target.bind("<Enter>", lambda event, i=index: self._select(i))
@@ -315,8 +322,8 @@ class PopupMenu:
     def add_command(self, *, label: str, command, state: str = "normal") -> None:
         self._add_row("command", label, state, command)
 
-    def add_info(self, *, label: str) -> None:
-        self._add_row("info", label, "disabled")
+    def add_info(self, *, label: str, right_text: str | None = None) -> None:
+        self._add_row("info", label, "disabled", right_text=right_text)
 
     def add_checkbutton(self, *, label: str, variable: tk.BooleanVar, command) -> None:
         self._add_row("check", label, command=command, variable=variable)
@@ -413,6 +420,9 @@ class PopupMenu:
         for target in (entry["widget"], entry["text_widget"], entry["indicator"]):
             target.configure(bg=background, cursor="hand2" if enabled else "arrow")
         entry["text_widget"].configure(text=entry["label"], fg=foreground)
+        if entry["right_widget"] is not None:
+            entry["right_widget"].configure(text=entry["right_text"], fg=foreground,
+                                            bg=background)
         indicator = entry["indicator"]
         indicator.delete("all")
         if entry["kind"] == "check":
@@ -608,7 +618,7 @@ class UsageWidget:
         self.menu.add_separator()
         self.menu.add_info(label="크레딧: —")
         self.credit_index = self.menu.index("end")
-        self.menu.add_info(label="사용량 리셋권: —")
+        self.menu.add_info(label="사용량 리셋권: —", right_text="")
         self.reset_count_index = self.menu.index("end")
         self.menu.add_command(label="리셋권 사용하기", state="disabled", command=self._use_reset_credit)
         self.reset_use_index = self.menu.index("end")
@@ -1052,9 +1062,18 @@ class UsageWidget:
 
     def _update_reset_menu(self) -> None:
         count = self.snapshot.reset_credit_count if self.snapshot else None
+        expires_at = self.snapshot.reset_credit_expires_at if self.snapshot else None
+        expiry = ""
+        if count:
+            try:
+                expiry = (f"~{datetime.fromtimestamp(expires_at):%m.%d.}"
+                          if expires_at is not None else "만료일 조회 불가")
+            except (OverflowError, OSError, ValueError):
+                expiry = "만료일 조회 불가"
         self.menu.entryconfigure(
             self.reset_count_index,
             label=f"사용량 리셋권: {count}개" if count is not None else "사용량 리셋권: 조회 불가",
+            right_text=expiry,
         )
         retry = self.reset_request_key is not None
         enabled = (not self.resetting and not self.refreshing

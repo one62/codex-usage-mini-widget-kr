@@ -40,6 +40,7 @@ class UsageSnapshot:
     reached_type: str | None
     fetched_at: float
     reset_credit_count: int | None = None
+    reset_credit_expires_at: int | None = None
 
 
 def _window(value: Any) -> UsageWindow | None:
@@ -107,10 +108,21 @@ def parse_rate_limits(result: dict[str, Any]) -> UsageSnapshot:
 
     reset_credits = result.get("rateLimitResetCredits")
     reset_credit_count = None
+    reset_credit_expires_at = None
     if isinstance(reset_credits, dict):
         count = reset_credits.get("availableCount")
         if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
             reset_credit_count = count
+            details = reset_credits.get("credits")
+            if count > 0 and isinstance(details, list):
+                available = [credit for credit in details
+                             if isinstance(credit, dict) and credit.get("status") == "available"]
+                if len(available) == count and all(
+                    isinstance(credit.get("expiresAt"), int)
+                    and not isinstance(credit.get("expiresAt"), bool)
+                    for credit in available
+                ):
+                    reset_credit_expires_at = min(credit["expiresAt"] for credit in available)
 
     return UsageSnapshot(
         plan=str(rate_limits.get("planType") or result.get("planType") or "unknown"),
@@ -121,6 +133,7 @@ def parse_rate_limits(result: dict[str, Any]) -> UsageSnapshot:
         reached_type=rate_limits.get("rateLimitReachedType"),
         fetched_at=time.time(),
         reset_credit_count=reset_credit_count,
+        reset_credit_expires_at=reset_credit_expires_at,
     )
 
 
