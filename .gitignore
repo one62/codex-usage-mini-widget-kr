@@ -11,4 +11,12 @@ dist/
 .idea/
 .vscode/
 
-/diagnostics/
+**/diagnostics/
+
+AGENTS.md
+GEMINI.md
+gemini.md
+CLAUDE.md
+.codex/
+.agents/
+.agent/

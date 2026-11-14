@@ -1,4 +1,4 @@
-"""Persist the widget's appearance, screen position, and movement lock."""
+"""Shared widget preference persistence and atomic JSON file helpers."""
 
 from __future__ import annotations
 
@@ -18,15 +18,8 @@ class WidgetSettings:
     hover_transparency_enabled: bool = True
 
 
-@dataclass(frozen=True)
-class PendingReset:
-    key: str
-    executable: str
-    credit_id: str
-
-
-def settings_path() -> Path:
-    return Path(os.environ.get("LOCALAPPDATA", Path.home())) / "CodexUsageMini" / "settings.json"
+def app_settings_path(app_dir_name: str) -> Path:
+    return Path(os.environ.get("LOCALAPPDATA", Path.home())) / app_dir_name / "settings.json"
 
 
 def _integer_in_range(value: object, minimum: int, maximum: int) -> bool:
@@ -34,7 +27,7 @@ def _integer_in_range(value: object, minimum: int, maximum: int) -> bool:
     return type(value) is int and minimum <= value <= maximum
 
 
-def _validated_settings(data: object) -> WidgetSettings:
+def validate_settings(data: object) -> WidgetSettings:
     settings = WidgetSettings()
     if not isinstance(data, dict):
         return settings
@@ -57,54 +50,39 @@ def _validated_settings(data: object) -> WidgetSettings:
     return settings
 
 
-def load_settings() -> WidgetSettings:
+def load_settings_from_path(path: Path) -> WidgetSettings:
     """Read settings without creating or changing any files."""
-    try:
-        with settings_path().open("r", encoding="utf-8") as source:
-            data = json.load(source)
-    except (OSError, UnicodeError, ValueError, RecursionError):
-        return WidgetSettings()
-    return _validated_settings(data)
-
-
-def save_settings(settings: WidgetSettings) -> None:
-    """Atomically replace the settings file, propagating filesystem failures."""
-    settings = _validated_settings(
-        {"transparency": settings.transparency, "x": settings.x, "y": settings.y,
-         "movement_locked": settings.movement_locked,
-         "hover_transparency_enabled": settings.hover_transparency_enabled}
-    )
-    data = {"transparency": settings.transparency, "x": settings.x, "y": settings.y,
-            "movement_locked": settings.movement_locked,
-            "hover_transparency_enabled": settings.hover_transparency_enabled}
-    _write_json(settings_path(), data)
-
-
-def load_pending_reset() -> PendingReset | None:
-    path = settings_path().with_name("pending-reset.json")
     try:
         with path.open("r", encoding="utf-8") as source:
             data = json.load(source)
-    except FileNotFoundError:
-        return None
-    if not isinstance(data, dict):
-        raise ValueError("Invalid pending reset")
-    key, executable, credit_id = (data.get(name) for name in ("key", "executable", "credit_id"))
-    if not all(isinstance(value, str) and value.strip() for value in (key, executable, credit_id)):
-        raise ValueError("Invalid pending reset")
-    return PendingReset(key, executable, credit_id)
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return WidgetSettings()
+    return validate_settings(data)
 
 
-def save_pending_reset(request: PendingReset | None) -> None:
-    path = settings_path().with_name("pending-reset.json")
-    if request is None:
-        path.unlink(missing_ok=True)
-    else:
-        _write_json(path, {"key": request.key, "executable": request.executable,
-                           "credit_id": request.credit_id})
+def save_settings_to_path(settings: WidgetSettings, path: Path) -> None:
+    """Atomically replace the settings file, propagating filesystem failures."""
+    validated = validate_settings(
+        {
+            "transparency": settings.transparency,
+            "x": settings.x,
+            "y": settings.y,
+            "movement_locked": settings.movement_locked,
+            "hover_transparency_enabled": settings.hover_transparency_enabled,
+        }
+    )
+    data = {
+        "transparency": validated.transparency,
+        "x": validated.x,
+        "y": validated.y,
+        "movement_locked": validated.movement_locked,
+        "hover_transparency_enabled": validated.hover_transparency_enabled,
+    }
+    write_json_atomic(path, data)
 
 
-def _write_json(destination: Path, data: dict) -> None:
+def write_json_atomic(destination: Path, data: dict) -> None:
+    """Write JSON to a temporary file and atomically replace destination."""
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     temporary: Path | None = None

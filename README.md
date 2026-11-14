@@ -1,60 +1,29 @@
-# Codex Usage Mini Widget KR
+# AI Usage Mini Widgets
 
-Codex 계정의 사용량을 확인하는 한국어 Windows 미니 위젯입니다.
+Codex(ChatGPT)와 Gemini(Antigravity) 사용량을 바탕화면에 작게 띄워 확인하는 Windows 미니 위젯 모음입니다.
 
-## 주요 기능
+## 폴더 구성
 
-- 5시간·주간 사용률과 초기화까지 남은 시간을 표시합니다. 주간 초기화까지 3일 12시간이 남으면 `3d 12h`로 표시합니다.
-- 시작 시 글꼴 폭을 측정해 창 너비를 정하고, 사용량과 초기화 정보를 고정 폭으로 오른쪽 정렬합니다.
-- 좌클릭은 뒤쪽 프로그램으로 전달하고, 우클릭으로 메뉴를 열거나 드래그하여 위젯을 이동합니다.
-- 이동 잠금 옵션으로 우클릭 드래그 이동을 막고, 잠금 설정을 다음 실행에도 유지합니다.
-- 메뉴에서 투명도를 0~100%로 조절하고, 투명도와 위치를 저장하여 다음 실행 때 복원합니다.
-- 투명도 설정 아래의 '마우스를 올리면 투명도 80%' 옵션으로 효과를 켜고 끌 수 있습니다. 기본값은 켜짐이며 선택은 다음 실행에도 유지됩니다.
-- 효과가 켜져 있으면 마우스를 위젯 위에 올릴 때 투명도가 80%로 바뀌고, 벗어나면 설정한 투명도로 돌아옵니다.
-- 1분마다 사용량을 갱신하며, 연결 실패 시 자동으로 재시도합니다.
-- 메뉴에서 연결된 계정·요금제·크레딧·리셋권·연결 상태를 확인하고, 확인창 승인 후 리셋권을 사용할 수 있습니다. 계정 정보가 제공되지 않으면 `—`로 표시합니다.
-- 수동 새로고침, 항상 맨 위 표시, Windows 자동 실행, ChatGPT 열기와 종료를 지원합니다.
+- `common/`: 두 위젯이 함께 사용하는 설정 저장(`settings.py`), 창·후킹·트레이/메뉴·공통 UI(`widget_base.py`), 넥슨 풋볼고딕 폰트(`assets/fonts/`)
+- `codex-usage-widget/`: Codex 사용량 미니 위젯 ([상세 안내](codex-usage-widget/README.md))
+- `gemini-usage-widget/`: Gemini / Antigravity 사용량 미니 위젯 ([상세 안내](gemini-usage-widget/README.md))
 
-표시되는 사용률은 **사용한 비율**이며, 기본 투명도는 30%입니다.
+## 실행 및 재시작
 
-## 표시와 크기
+루트 폴더의 배치 파일을 실행하면 해당 위젯을 실행합니다. 이미 같은 위젯이 실행 중이면 기존 프로세스를 종료한 뒤 다시 시작합니다.
 
-- 넥슨 풋볼고딕을 사용하며, 사용량은 Bold 9pt, 초기화 시간·날짜는 Light 9pt로 표시합니다.
-- 위젯 왼쪽에 Codex 로고를 표시합니다. 로고 이미지는 설치된 Codex Windows 앱의 아이콘을 사용합니다.
-- 우클릭 메뉴는 풋볼고딕 Light와 Tk 기본 메뉴 글자 크기를 사용하고, 내용에 맞춰 창 크기를 계산합니다.
-- 위젯은 최소 너비 270px·높이 38px이며, 위젯과 메뉴는 모니터 작업 영역 안에 위치하도록 조정합니다.
+- Codex 위젯: `start_codex_widget.bat`
+- Gemini 위젯: `start_gemini_widget.bat`
 
-해상도에 비례해 확대하는 방식은 아니며, 실행 중 배율 변경·서로 다른 배율의 모니터 이동 시 글꼴 폭을 다시 측정하지 않습니다.
-일부 여백·컨트롤 크기는 고정 픽셀이므로 배율을 바꾼 뒤에는 재시작하고 글자 잘림을 확인해 주세요.
-
-## 실행
-
-Windows 10/11, Tkinter를 포함한 Python 3.10 이상, 로그인된 Codex 데스크톱 앱 또는 CLI가 필요합니다.
-
-넥슨 풋볼고딕을 `assets/fonts`에서 불러오므로 별도 폰트 설치는 필요하지 않으며, 프로젝트를 복사할 때 로고를 포함한 `assets` 폴더도 함께 포함합니다.
-
-`launch_widget.bat`를 더블클릭하거나 이 폴더에서 실행합니다.
+직접 Python으로 실행할 수도 있습니다.
 
 ```powershell
-python widget.py
+python codex-usage-widget\widget.py
+python gemini-usage-widget\widget.py
 ```
-
-코드 변경 후에는 위젯을 종료하고 다시 실행합니다.
-
-재시작 후 글자·메뉴 표시, 우클릭 메뉴 열기, 드래그 이동과 이동 잠금, 투명도·위치·잠금 설정 복원을 확인할 수 있습니다.
-
-## 저장 파일
-
-- 설정: `%LOCALAPPDATA%\CodexUsageMini\settings.json` (투명도·마우스 진입 효과·위치·이동 잠금)
-- 미확정 리셋권 요청: `%LOCALAPPDATA%\CodexUsageMini\pending-reset.json` (재시작 후 같은 요청 재확인에 사용)
-- 오류 로그: 로컬 진단 모듈이 있을 때만 `diagnostics/widget.log`에 오류 유형 기록
-
-사용량 조회는 설치된 Codex 클라이언트의 인증을 사용하며, 별도 API 키 입력은 필요하지 않습니다.
 
 ## 라이선스
 
-[Wannatep/codex-usage-mini-widget](https://github.com/Wannatep/codex-usage-mini-widget)을 기반으로 하며, 원본의 [The Unlicense](UNLICENSE)를 유지합니다.
+[Wannatep/codex-usage-mini-widget](https://github.com/Wannatep/codex-usage-mini-widget)을 기반으로 하며, 루트의 [The Unlicense](UNLICENSE)를 유지합니다.
 
-OpenAI의 공식 제품이 아닌 커뮤니티 프로젝트입니다.
-
-동봉한 넥슨 풋볼고딕의 [저작권·이용 조건](assets/fonts/NEXON-LICENSE.txt)과 [출처 안내](assets/fonts/README.md)를 함께 제공합니다.
+동봉한 넥슨 풋볼고딕의 [저작권·이용 조건](common/assets/fonts/NEXON-LICENSE.txt)과 [출처 안내](common/assets/fonts/README.md)를 함께 제공합니다.

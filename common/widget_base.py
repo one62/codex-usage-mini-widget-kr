@@ -1,46 +1,21 @@
-"""Small always-on-top Windows widget for ChatGPT Work/Codex usage."""
+"""Shared UI, Win32 helpers, popup menu, and base widget for usage widgets."""
 
 from __future__ import annotations
 
 import atexit
+import ctypes
 import os
 import queue
-import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
-import webbrowser
 import winreg
-import uuid
-import ctypes
 from ctypes import wintypes
-from decimal import Decimal
-from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox
 from tkinter import font as tkfont
-
-from codex_usage import UsageSnapshot, consume_reset_credit, find_codex_executables, query_usage
-from widget_settings import (
-    PendingReset, load_pending_reset, load_settings, save_pending_reset, save_settings,
-)
-
-try:
-    from diagnostics.error_log import record_error
-except ModuleNotFoundError as exc:
-    if exc.name not in ("diagnostics", "diagnostics.error_log"):
-        raise
-
-    def record_error(event: str) -> None:
-        pass
-
-try:
-    from diagnostics.topmost import TopmostDiagnostics
-except ModuleNotFoundError as exc:
-    if exc.name not in ("diagnostics", "diagnostics.topmost"):
-        raise
-    TopmostDiagnostics = None
+from tkinter import messagebox
+from typing import Callable
 
 
 BG = "#222127"
@@ -59,13 +34,19 @@ GRADIENT_STOPS = (
 WINDOW_WIDTH = 270
 WINDOW_HEIGHT = 38
 FONT_FAMILY = "NEXON Football Gothic L"
+BOLD_FONT_FAMILY = "NEXON Football Gothic B"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-RUN_VALUE = "ChatGPTUsageWidget"
 RECOVERY_DELAYS = (15, 30, 60, 120, 300)
 
+DEFAULT_FONT_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
 
-def load_bundled_fonts() -> None:
-    font_directory = Path(__file__).resolve().parent / "assets" / "fonts"
+
+def load_bundled_fonts(
+    font_directory: Path | None = None,
+    on_error: Callable[[str], None] | None = None,
+) -> None:
+    """Register bundled Nexon Football Gothic fonts privately for this process."""
+    target_dir = font_directory or DEFAULT_FONT_DIR
     gdi32 = ctypes.WinDLL("gdi32")
     gdi32.AddFontResourceExW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
     gdi32.AddFontResourceExW.restype = ctypes.c_int
@@ -73,11 +54,11 @@ def load_bundled_fonts() -> None:
     gdi32.RemoveFontResourceExW.restype = wintypes.BOOL
     private_font = 0x10  # FR_PRIVATE: available only to this process.
     for filename in ("NEXONFootballGothic-Light.otf", "NEXONFootballGothic-Bold.otf"):
-        path = str(font_directory / filename)
+        path = str(target_dir / filename)
         if gdi32.AddFontResourceExW(path, private_font, None):
             atexit.register(gdi32.RemoveFontResourceExW, path, private_font, None)
-        else:
-            record_error("bundled_font_load_failed")
+        elif on_error is not None:
+            on_error(path)
 
 
 def recovery_delay(failure_count: int) -> int:
@@ -113,8 +94,13 @@ class _MonitorInfo(ctypes.Structure):
     ]
 
 
-def clamp_position(x: int, y: int, width: int, height: int,
-                   area: tuple[int, int, int, int]) -> tuple[int, int]:
+def clamp_position(
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    area: tuple[int, int, int, int],
+) -> tuple[int, int]:
     """Keep the entire widget inside a monitor's usable area."""
     left, top, right, bottom = area
     return (
@@ -189,30 +175,29 @@ def gradient_color(position: float) -> str:
     return GRADIENT_STOPS[-1][1]
 
 
-def pythonw_command() -> str:
+def pythonw_command_for(script_path: Path) -> str:
     interpreter = Path(sys.executable)
     pythonw = interpreter.with_name("pythonw.exe")
     selected = pythonw if pythonw.exists() else interpreter
-    script = Path(__file__).resolve()
-    return f'"{selected}" "{script}"'
+    return f'"{selected}" "{script_path.resolve()}"'
 
 
-def autostart_enabled() -> bool:
+def autostart_enabled_for(run_value: str, script_path: Path) -> bool:
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
-            value, _ = winreg.QueryValueEx(key, RUN_VALUE)
-            return value == pythonw_command()
+            value, _ = winreg.QueryValueEx(key, run_value)
+            return value == pythonw_command_for(script_path)
     except FileNotFoundError:
         return False
 
 
-def set_autostart(enabled: bool) -> None:
+def set_autostart_for(run_value: str, script_path: Path, enabled: bool) -> None:
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
         if enabled:
-            winreg.SetValueEx(key, RUN_VALUE, 0, winreg.REG_SZ, pythonw_command())
+            winreg.SetValueEx(key, run_value, 0, winreg.REG_SZ, pythonw_command_for(script_path))
         else:
             try:
-                winreg.DeleteValue(key, RUN_VALUE)
+                winreg.DeleteValue(key, run_value)
             except FileNotFoundError:
                 pass
 
@@ -242,12 +227,52 @@ def enable_dpi_awareness() -> None:
     raise RuntimeError("Could not enable per-monitor DPI awareness")
 
 
+def run_single_instance(
+    mutex_name: str,
+    app_title: str,
+    create_and_run: Callable[[], None],
+) -> None:
+    """Ensure only one instance per named Windows mutex runs at a time."""
+    if os.name != "nt":
+        raise SystemExit("이 위젯은 Windows에서만 실행할 수 있습니다.")
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel.CreateMutexW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+
+    error_already_exists = 183
+    ctypes.set_last_error(0)
+    mutex = kernel.CreateMutexW(None, False, mutex_name)
+    error = ctypes.get_last_error()
+    if not mutex:
+        raise ctypes.WinError(error)
+
+    if error == error_already_exists:
+        kernel.CloseHandle(mutex)
+        messagebox.showinfo(app_title, "위젯이 이미 실행 중입니다.")
+        return
+
+    try:
+        create_and_run()
+    finally:
+        kernel.CloseHandle(mutex)
+
+
 class PopupMenu:
     """Tk popup with inert information labels and selectable action rows."""
 
-    def __init__(self, root: tk.Tk, on_close) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        on_close: Callable[[], None],
+        *,
+        reserve_indicator_space: bool = False,
+    ) -> None:
         self.root = root
         self.on_close = on_close
+        self.reserve_indicator_space = reserve_indicator_space
         self.font = tkfont.nametofont("TkMenuFont", root=root).copy()
         self.font.configure(family=FONT_FAMILY)
         self.background = "#2A3032"
@@ -256,8 +281,12 @@ class PopupMenu:
         self.window.withdraw()
         self.window.overrideredirect(True)
         self.window.attributes("-topmost", True)
-        self.body = tk.Frame(self.window, bg=self.background,
-                             highlightbackground="#56525F", highlightthickness=1)
+        self.body = tk.Frame(
+            self.window,
+            bg=self.background,
+            highlightbackground="#56525F",
+            highlightthickness=1,
+        )
         self.body.pack(fill="both", expand=True)
         self.entries: list[dict] = []
         self.selected: int | None = None
@@ -273,30 +302,70 @@ class PopupMenu:
         self.window.bind("<End>", lambda event: self._adjust_scale(endpoint=100))
         self.window.bind("<FocusOut>", self._focus_out)
 
-    def _add_row(self, kind: str, label: str, state: str = "normal",
-                 command=None, variable: tk.BooleanVar | None = None,
-                 right_text: str | None = None) -> None:
+    def _add_row(
+        self,
+        kind: str,
+        label: str,
+        state: str = "normal",
+        command=None,
+        variable: tk.BooleanVar | None = None,
+        right_text: str | None = None,
+    ) -> None:
         index = len(self.entries)
         row = tk.Frame(self.body, bg=self.background, bd=0)
         row.pack(fill="x")
         indicator = None
-        if kind == "check":
-            indicator = tk.Canvas(row, width=18, height=18, bg=self.background,
-                                  bd=0, highlightthickness=0)
+        if self.reserve_indicator_space or kind == "check":
+            indicator = tk.Canvas(
+                row,
+                width=18,
+                height=18,
+                bg=self.background,
+                bd=0,
+                highlightthickness=0,
+            )
             indicator.pack(side="left", padx=(12, 6))
         right_widget = None
         if right_text is not None:
-            right_widget = tk.Label(row, anchor="e", padx=0, pady=6,
-                                    bg=self.background, bd=0, font=self.font)
+            right_widget = tk.Label(
+                row,
+                anchor="e",
+                padx=0,
+                pady=6,
+                bg=self.background,
+                bd=0,
+                font=self.font,
+            )
             right_widget.pack(side="right", padx=(0, 12))
-        text_widget = tk.Label(row, anchor="w", padx=0, pady=6,
-                               bg=self.background, bd=0, font=self.font)
-        text_widget.pack(side="left", fill="both", expand=True,
-                         padx=(0 if indicator else 12, 12))
-        self.entries.append(dict(kind=kind, label=label, state=state,
-                                 command=command, variable=variable, widget=row,
-                                 text_widget=text_widget, indicator=indicator,
-                                 right_widget=right_widget, right_text=right_text))
+        text_widget = tk.Label(
+            row,
+            anchor="w",
+            padx=0,
+            pady=6,
+            bg=self.background,
+            bd=0,
+            font=self.font,
+        )
+        text_widget.pack(
+            side="left",
+            fill="both",
+            expand=True,
+            padx=(0 if indicator else 12, 12),
+        )
+        self.entries.append(
+            dict(
+                kind=kind,
+                label=label,
+                state=state,
+                command=command,
+                variable=variable,
+                widget=row,
+                text_widget=text_widget,
+                indicator=indicator,
+                right_widget=right_widget,
+                right_text=right_text,
+            )
+        )
         if kind != "info":
             for target in (row, indicator, text_widget):
                 if target is not None:
@@ -312,6 +381,60 @@ class PopupMenu:
     def add_info(self, *, label: str, right_text: str | None = None) -> None:
         self._add_row("info", label, "disabled", right_text=right_text)
 
+    def add_dynamic_section(self) -> tk.Frame:
+        container = tk.Frame(self.body, bg=self.background, bd=0)
+        container.pack(fill="x")
+        return container
+
+    def set_dynamic_info_rows(
+        self,
+        container: tk.Frame,
+        rows: list[tuple[str, str | None]],
+    ) -> None:
+        for child in container.winfo_children():
+            child.destroy()
+        for label, right_text in rows:
+            row = tk.Frame(container, bg=self.background, bd=0)
+            row.pack(fill="x")
+            if self.reserve_indicator_space:
+                indicator = tk.Canvas(
+                    row,
+                    width=18,
+                    height=18,
+                    bg=self.background,
+                    bd=0,
+                    highlightthickness=0,
+                )
+                indicator.pack(side="left", padx=(12, 6))
+                left_pad = 0
+            else:
+                left_pad = 12
+            if right_text is not None:
+                tk.Label(
+                    row,
+                    text=right_text,
+                    anchor="e",
+                    padx=0,
+                    pady=6,
+                    bg=self.background,
+                    fg=MUTED,
+                    bd=0,
+                    font=self.font,
+                ).pack(side="right", padx=(8, 12))
+            tk.Label(
+                row,
+                text=label,
+                anchor="w",
+                padx=0,
+                pady=6,
+                bg=self.background,
+                fg=MUTED,
+                bd=0,
+                font=self.font,
+            ).pack(side="left", fill="both", expand=True, padx=(left_pad, 12))
+        if self.open:
+            self._fit_window(self.window.winfo_x(), self.window.winfo_y())
+
     def add_checkbutton(self, *, label: str, variable: tk.BooleanVar, command) -> None:
         self._add_row("check", label, command=command, variable=variable)
 
@@ -321,29 +444,67 @@ class PopupMenu:
         row.pack(fill="x", padx=12, pady=4)
         caption = tk.Frame(row, bg=self.background)
         caption.pack(fill="x")
-        text_widget = tk.Label(caption, text=label, anchor="w", bg=self.background,
-                               fg=TEXT, font=self.font)
+        text_widget = tk.Label(
+            caption,
+            text=label,
+            anchor="w",
+            bg=self.background,
+            fg=TEXT,
+            font=self.font,
+        )
         text_widget.pack(side="left")
         font = self.font
-        value_box = tk.Frame(caption, bg=self.background,
-                             width=font.measure("100%") + 4, height=font.metrics("linespace") + 4)
+        value_box = tk.Frame(
+            caption,
+            bg=self.background,
+            width=font.measure("100%") + 4,
+            height=font.metrics("linespace") + 4,
+        )
         value_box.pack(side="right")
         value_box.pack_propagate(False)
-        value_widget = tk.Label(value_box, text=f"{variable.get()}%", anchor="e",
-                                bg=self.background, fg=TEXT, font=font)
+        value_widget = tk.Label(
+            value_box,
+            text=f"{variable.get()}%",
+            anchor="e",
+            bg=self.background,
+            fg=TEXT,
+            font=font,
+        )
         value_widget.pack(fill="both", expand=True)
         scale = tk.Scale(
-            row, from_=0, to=100, resolution=1, orient="horizontal",
-            variable=variable, showvalue=False, length=210, width=12,
-            sliderlength=16, bd=0, highlightthickness=0, takefocus=True,
-            bg=self.background, troughcolor="#424149", activebackground="#8CD9F5",
+            row,
+            from_=0,
+            to=100,
+            resolution=1,
+            orient="horizontal",
+            variable=variable,
+            showvalue=False,
+            length=210,
+            width=12,
+            sliderlength=16,
+            bd=0,
+            highlightthickness=0,
+            takefocus=True,
+            bg=self.background,
+            troughcolor="#424149",
+            activebackground="#8CD9F5",
             command=lambda value, i=index: self._scale_changed(i, value),
         )
         scale.pack(fill="x")
-        self.entries.append(dict(kind="scale", label=label, state="normal",
-                                 command=command, variable=variable, widget=row,
-                                 text_widget=text_widget, value_widget=value_widget,
-                                 scale=scale, font=font))
+        self.entries.append(
+            dict(
+                kind="scale",
+                label=label,
+                state="normal",
+                command=command,
+                variable=variable,
+                widget=row,
+                text_widget=text_widget,
+                value_widget=value_widget,
+                scale=scale,
+                font=font,
+            )
+        )
         for target in (row, caption, text_widget, value_widget, scale):
             target.bind("<Enter>", lambda event, i=index: self._select(i))
         scale.bind("<ButtonPress-1>", lambda event, i=index: self._select(i), add="+")
@@ -409,15 +570,19 @@ class PopupMenu:
                 target.configure(bg=background, cursor="hand2" if enabled else "arrow")
         entry["text_widget"].configure(text=entry["label"], fg=foreground)
         if entry["right_widget"] is not None:
-            entry["right_widget"].configure(text=entry["right_text"], fg=foreground,
-                                            bg=background)
+            entry["right_widget"].configure(
+                text=entry["right_text"],
+                fg=foreground,
+                bg=background,
+            )
         indicator = entry["indicator"]
         if indicator is not None:
             indicator.delete("all")
-            # Draw the check instead of depending on a font's Unicode glyph.
-            indicator.create_rectangle(2, 2, 15, 15, outline=foreground)
-            if entry["variable"].get():
-                indicator.create_line(4, 8, 7, 11, 13, 5, fill=foreground, width=2)
+            if entry["kind"] == "check":
+                # Draw the check instead of depending on a font's Unicode glyph.
+                indicator.create_rectangle(2, 2, 15, 15, outline=foreground)
+                if entry["variable"].get():
+                    indicator.create_line(4, 8, 7, 11, 13, 5, fill=foreground, width=2)
 
     def _select(self, index: int | None) -> None:
         previous = self.selected
@@ -492,17 +657,22 @@ class PopupMenu:
                 self.close()
 
 
-class UsageWidget:
-    def __init__(self) -> None:
+class BaseUsageWidget:
+    """Common windowing, hook, transparency, and layout behavior for usage widgets."""
+
+    APP_TITLE = "Usage"
+    RUN_VALUE = ""
+
+    def _init_base(self, *, script_path: Path) -> None:
         enable_dpi_awareness()
-        load_bundled_fonts()
-        self.settings = load_settings()
+        load_bundled_fonts(on_error=self._on_font_load_error)
+        self._script_path = script_path
+        self.settings = self._load_widget_settings()
         self._settings_after_id: str | None = None
         self._settings_ready = False
         self._closing = False
-        self._diagnostics = None
         self.root = tk.Tk()
-        self.root.title("ChatGPT Usage")
+        self.root.title(self.APP_TITLE)
         self.root.configure(bg=BG)
         self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self.root.resizable(False, False)
@@ -511,45 +681,80 @@ class UsageWidget:
         self.transparency = tk.IntVar(master=self.root, value=self.settings.transparency)
         self.movement_locked = tk.BooleanVar(master=self.root, value=self.settings.movement_locked)
         self.hover_transparency_enabled = tk.BooleanVar(
-            master=self.root, value=self.settings.hover_transparency_enabled)
+            master=self.root,
+            value=self.settings.hover_transparency_enabled,
+        )
         self._hovered = False
         self.root.attributes("-alpha", 1.0 - self.transparency.get() / 100)
-        self.snapshot: UsageSnapshot | None = None
+        self.snapshot = None
         self.drag_origin: tuple[int, int] | None = None
         self.results: queue.Queue[tuple[int, str, object]] = queue.Queue()
         self.refreshing = False
-        self.resetting = False
-        self.reset_state_unreadable = False
-        try:
-            self.pending_reset = load_pending_reset()
-        except (OSError, ValueError, RecursionError):
-            self.pending_reset = None
-            self.reset_state_unreadable = True
-            record_error("pending_reset_load_failed")
-        self.reset_results: queue.Queue[tuple[str, object]] = queue.Queue()
         self.fetch_generation = 0
         self.failure_count = 0
         self.recovery_after_id: str | None = None
-        self.connection_failed = False
         self.always_on_top = tk.BooleanVar(value=True)
-        self.autostart = tk.BooleanVar(value=autostart_enabled())
-        self._build()
+        self.autostart = tk.BooleanVar(value=autostart_enabled_for(self.RUN_VALUE, self._script_path))
+
+    def _finalize_init(self) -> None:
         self._restore_position()
         self._apply_rounded_corners()
         self._bind_actions()
         self._enable_click_through()
-        if TopmostDiagnostics is not None:
-            self._diagnostics = TopmostDiagnostics(self)
-            self._diagnostics.check()
+        self._after_window_ready()
         self._settings_ready = True
         self._update_hover()
         self.refresh()
         self.root.after(500, self._drain_results)
-        self.root.after(500, self._drain_reset_results)
+        self._start_extra_timers()
         self.root.after(60_000, self._update_clock)
         self.root.after(60_000, self._scheduled_refresh)
 
-    def _build(self) -> None:
+    # Subclass extension points (with safe defaults for partial test instances)
+    def _on_font_load_error(self, path: str) -> None:
+        pass
+
+    def _on_settings_save_error(self, exc: OSError) -> None:
+        pass
+
+    def _on_mouse_hook_error(self, exc: Exception) -> None:
+        pass
+
+    def _log_topmost_action(self, message: str, *args: object) -> None:
+        pass
+
+    def _load_widget_settings(self):
+        raise NotImplementedError
+
+    def _save_widget_settings(self, settings) -> None:
+        raise NotImplementedError
+
+    def _after_window_ready(self) -> None:
+        pass
+
+    def _start_extra_timers(self) -> None:
+        pass
+
+    def _update_connection_status(self) -> None:
+        pass
+
+    def _render_connection_issue(self) -> None:
+        pass
+
+    def _render(self, snapshot) -> None:
+        raise NotImplementedError
+
+    def refresh(self) -> None:
+        raise NotImplementedError
+
+    def _build_header_shell(
+        self,
+        *,
+        logo_path: Path,
+        on_logo_error: Callable[[], None],
+        five_fg: str,
+        week_fg: str,
+    ) -> None:
         outer = tk.Frame(self.root, bg=BG, highlightbackground="#56525F", highlightthickness=1)
         outer.pack(fill="both", expand=True)
 
@@ -558,99 +763,138 @@ class UsageWidget:
         header.pack_propagate(True)
         self.header = header
 
-        logo_path = Path(__file__).resolve().parent / "assets" / "codex-logo.png"
         try:
-            self.codex_logo = tk.PhotoImage(master=self.root, file=str(logo_path))
-            tk.Label(header, image=self.codex_logo, bg=BG, bd=0).pack(side="left", padx=(2, 4))
+            self._logo_image = tk.PhotoImage(master=self.root, file=str(logo_path))
+            tk.Label(header, image=self._logo_image, bg=BG, bd=0).pack(side="left", padx=(2, 4))
         except tk.TclError:
-            record_error("codex_logo_load_failed")
+            on_logo_error()
 
-        percent_font = tkfont.Font(self.root, family="NEXON Football Gothic B", size=9)
+        percent_font = tkfont.Font(self.root, family=BOLD_FONT_FAMILY, size=9)
         reset_font = tkfont.Font(self.root, family=FONT_FAMILY, size=9)
 
-        def add_right_aligned_label(text: str, max_text: str, color: str,
-                                    font: tkfont.Font,
-                                    padx: tuple[int, int] = (0, 0)) -> tk.Label:
+        def add_right_aligned_label(
+            text: str,
+            max_text: str,
+            color: str,
+            font: tkfont.Font,
+            padx: tuple[int, int] = (0, 0),
+        ) -> tk.Label:
             # Measure with Tk's active font metrics, which already reflect DPI scaling.
             column = tk.Frame(header, width=font.measure(max_text), height=18, bg=BG)
             column.pack_propagate(False)
             label = tk.Label(
-                column, text=text, anchor="e", padx=0, pady=0,
-                bd=0, highlightthickness=0,
-                fg=color, bg=BG, font=font,
+                column,
+                text=text,
+                anchor="e",
+                padx=0,
+                pady=0,
+                bd=0,
+                highlightthickness=0,
+                fg=color,
+                bg=BG,
+                font=font,
             )
             label.pack(fill="both", expand=True)
             column.pack(side="left", padx=padx)
             return label
 
-        def add_metric_labels(title: str, value: str, max_text: str, color: str,
-                              font: tkfont.Font,
-                              padx: tuple[int, int] = (1, 0)) -> tuple[tk.Label, tk.Label]:
+        def add_metric_labels(
+            title: str,
+            value: str,
+            max_text: str,
+            color: str,
+            font: tkfont.Font,
+            padx: tuple[int, int] = (1, 0),
+        ) -> tuple[tk.Label, tk.Label]:
             column = tk.Frame(header, width=font.measure(max_text), height=18, bg=BG)
             column.pack_propagate(False)
             title_label = tk.Label(
-                column, text=title, anchor="w", padx=0, pady=0,
-                bd=0, highlightthickness=0,
-                fg=color, bg=BG, font=font,
+                column,
+                text=title,
+                anchor="w",
+                padx=0,
+                pady=0,
+                bd=0,
+                highlightthickness=0,
+                fg=color,
+                bg=BG,
+                font=font,
             )
             title_label.pack(side="left", fill="y")
             value_label = tk.Label(
-                column, text=value, anchor="e", padx=0, pady=0,
-                bd=0, highlightthickness=0,
-                fg=color, bg=BG, font=font,
+                column,
+                text=value,
+                anchor="e",
+                padx=0,
+                pady=0,
+                bd=0,
+                highlightthickness=0,
+                fg=color,
+                bg=BG,
+                font=font,
             )
             value_label.pack(side="left", fill="both", expand=True)
             column.pack(side="left", padx=padx)
             return title_label, value_label
 
         self.five_title, self.five_label = add_metric_labels(
-            "5H", "—%", "5H 100%", TEXT, percent_font,
+            "5H",
+            "—%",
+            "5H 100%",
+            five_fg,
+            percent_font,
         )
         self.five_meter = tk.Canvas(header, width=23, height=10, bg=BG, bd=0, highlightthickness=0)
         self.five_meter.pack(side="left", padx=(3, 5))
         self.reset_compact = add_right_aligned_label(
-            "—", "5h 59m", MUTED, reset_font, padx=(0, 8),
+            "—",
+            "5h 59m",
+            MUTED,
+            reset_font,
+            padx=(0, 8),
         )
 
         tk.Frame(header, bg="#56525F", width=1, height=18).pack(side="left", padx=(0, 5))
 
         self.week_title, self.week_label = add_metric_labels(
-            "WK", "—%", "WK 100%", TEXT, percent_font,
+            "WK",
+            "—%",
+            "WK 100%",
+            week_fg,
+            percent_font,
         )
         self.week_meter = tk.Canvas(header, width=23, height=10, bg=BG, bd=0, highlightthickness=0)
         self.week_meter.pack(side="left", padx=(3, 5))
         self.week_reset = add_right_aligned_label(
-            "—", "7d 23h", MUTED, reset_font,
+            "—",
+            "7d 23h",
+            MUTED,
+            reset_font,
         )
 
-        self.menu = PopupMenu(self.root, self._menu_closed)
-        self.menu.add_command(label="지금 새로고침", command=self.refresh)
-        self.menu.add_info(label="연결 상태: 확인 전")
-        self.connection_status_index = self.menu.index("end")
-        self.menu.add_separator()
-        self.menu.add_info(label="계정: —")
-        self.account_index = self.menu.index("end")
-        self.menu.add_info(label="요금제: —", right_text="크레딧: —")
-        self.plan_index = self.menu.index("end")
-        self.menu.add_info(label="사용량 리셋권: —", right_text="")
-        self.reset_count_index = self.menu.index("end")
-        self.menu.add_command(label="리셋권 사용하기", state="disabled", command=self._use_reset_credit)
-        self.reset_use_index = self.menu.index("end")
-        self.menu.add_separator()
-        self.menu.add_scale(label="투명도", variable=self.transparency,
-                            command=self._set_transparency)
-        self.menu.add_checkbutton(label="마우스를 올리면 투명도 80%",
-                                  variable=self.hover_transparency_enabled,
-                                  command=self._toggle_hover_transparency)
-        self.menu.add_checkbutton(label="이동 잠금", variable=self.movement_locked,
-                                  command=self._schedule_settings_save)
-        self.menu.add_separator()
-        self.menu.add_checkbutton(label="항상 맨 위에 표시", variable=self.always_on_top, command=self._toggle_topmost)
-        self.menu.add_checkbutton(label="Windows 시작 시 자동 실행", variable=self.autostart, command=self._toggle_autostart)
-        self.menu.add_separator()
-        self.menu.add_command(label="ChatGPT 데스크톱 열기", command=self._open_chatgpt)
-        self.menu.add_command(label="종료", command=self._close)
-        self._fit_content_width()
+    def _add_common_preference_menu_items(self, menu: PopupMenu) -> None:
+        menu.add_scale(label="투명도", variable=self.transparency, command=self._set_transparency)
+        menu.add_checkbutton(
+            label="마우스를 올리면 투명도 80%",
+            variable=self.hover_transparency_enabled,
+            command=self._toggle_hover_transparency,
+        )
+        menu.add_checkbutton(
+            label="이동 잠금",
+            variable=self.movement_locked,
+            command=self._schedule_settings_save,
+        )
+        menu.add_separator()
+        menu.add_checkbutton(
+            label="항상 맨 위에 표시",
+            variable=self.always_on_top,
+            command=self._toggle_topmost,
+        )
+        menu.add_checkbutton(
+            label="Windows 시작 시 자동 실행",
+            variable=self.autostart,
+            command=self._toggle_autostart,
+        )
 
     def _fit_content_width(self) -> None:
         """Fit the window to fixed pixel columns measured at the current DPI."""
@@ -700,9 +944,9 @@ class UsageWidget:
         self.settings.hover_transparency_enabled = self.hover_transparency_enabled.get()
         self.settings.x, self.settings.y = self.root.winfo_x(), self.root.winfo_y()
         try:
-            save_settings(self.settings)
-        except OSError:
-            record_error("settings_save_failed")
+            self._save_widget_settings(self.settings)
+        except OSError as exc:
+            self._on_settings_save_error(exc)
 
     def _close(self) -> None:
         if self._closing:
@@ -718,8 +962,7 @@ class UsageWidget:
         screen_width = self.root.winfo_screenwidth()
         width = self.root.winfo_width()
         area = monitor_work_area(screen_width - 1, 0, width, WINDOW_HEIGHT)
-        x, y = clamp_position(area[2] - width - 18, area[1] + 18,
-                              width, WINDOW_HEIGHT, area)
+        x, y = clamp_position(area[2] - width - 18, area[1] + 18, width, WINDOW_HEIGHT, area)
         self.root.geometry(f"{width}x{WINDOW_HEIGHT}+{x}+{y}")
 
     def _apply_rounded_corners(self) -> None:
@@ -727,7 +970,10 @@ class UsageWidget:
         try:
             preference = ctypes.c_int(2)  # DWMWCP_ROUND
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                self.root.winfo_id(), 33, ctypes.byref(preference), ctypes.sizeof(preference)
+                self.root.winfo_id(),
+                33,
+                ctypes.byref(preference),
+                ctypes.sizeof(preference),
             )
         except (AttributeError, OSError):
             pass
@@ -736,26 +982,42 @@ class UsageWidget:
         """Keep the body transparent; intercept only right gestures starting on it."""
         self._input_api = ctypes.WinDLL("user32", use_last_error=True)
         api = self._input_api
-        self._hook_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
-                                            ctypes.c_size_t, ctypes.c_ssize_t)
+        self._hook_type = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t,
+            ctypes.c_int,
+            ctypes.c_size_t,
+            ctypes.c_ssize_t,
+        )
         signatures = {
             "GetAncestor": ([ctypes.c_void_p, ctypes.c_uint], ctypes.c_void_p),
             "GetWindowLongW": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_long),
             "SetWindowLongW": ([ctypes.c_void_p, ctypes.c_int, ctypes.c_long], ctypes.c_long),
             "GetWindowRect": ([ctypes.c_void_p, ctypes.POINTER(_Rect)], ctypes.c_int),
             "IsWindowVisible": ([ctypes.c_void_p], ctypes.c_int),
+            "GetForegroundWindow": ([], ctypes.c_void_p),
+            "GetWindow": ([ctypes.c_void_p, ctypes.c_uint], ctypes.c_void_p),
             "WindowFromPoint": ([wintypes.POINT], wintypes.HWND),
-            "SetWindowsHookExW": ([ctypes.c_int, self._hook_type, ctypes.c_void_p,
-                                    ctypes.c_ulong], ctypes.c_void_p),
-            "CallNextHookEx": ([ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t,
-                                ctypes.c_ssize_t], ctypes.c_ssize_t),
+            "SetWindowsHookExW": (
+                [ctypes.c_int, self._hook_type, ctypes.c_void_p, ctypes.c_ulong],
+                ctypes.c_void_p,
+            ),
+            "CallNextHookEx": (
+                [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t, ctypes.c_ssize_t],
+                ctypes.c_ssize_t,
+            ),
             "UnhookWindowsHookEx": ([ctypes.c_void_p], ctypes.c_int),
-            "PeekMessageW": ([ctypes.POINTER(wintypes.MSG), ctypes.c_void_p,
-                              ctypes.c_uint, ctypes.c_uint, ctypes.c_uint], ctypes.c_int),
-            "GetMessageW": ([ctypes.POINTER(wintypes.MSG), ctypes.c_void_p,
-                             ctypes.c_uint, ctypes.c_uint], ctypes.c_int),
-            "PostThreadMessageW": ([ctypes.c_ulong, ctypes.c_uint, ctypes.c_size_t,
-                                    ctypes.c_ssize_t], ctypes.c_int),
+            "PeekMessageW": (
+                [ctypes.POINTER(wintypes.MSG), ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint],
+                ctypes.c_int,
+            ),
+            "GetMessageW": (
+                [ctypes.POINTER(wintypes.MSG), ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint],
+                ctypes.c_int,
+            ),
+            "PostThreadMessageW": (
+                [ctypes.c_ulong, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t],
+                ctypes.c_int,
+            ),
         }
         for name, (arguments, result) in signatures.items():
             function = getattr(api, name)
@@ -767,8 +1029,10 @@ class UsageWidget:
         self._menu_open = False
         self._menu_hwnd = None
         self._dragged = False
-        self._drag_threshold = (max(1, api.GetSystemMetrics(68)),
-                                max(1, api.GetSystemMetrics(69)))  # SM_CX/YDRAG
+        self._drag_threshold = (
+            max(1, api.GetSystemMetrics(68)),
+            max(1, api.GetSystemMetrics(69)),
+        )  # SM_CX/YDRAG
 
         # Retain the callback until unhooked so ctypes cannot collect it.
         self._mouse_callback = self._hook_type(self._mouse_hook)
@@ -814,7 +1078,10 @@ class UsageWidget:
             # Create the thread queue before publishing readiness or posting WM_QUIT.
             api.PeekMessageW(ctypes.byref(message), None, 0, 0, 0)
             self._mouse_hook_handle = api.SetWindowsHookExW(
-                14, self._mouse_callback, kernel.GetModuleHandleW(None), 0
+                14,
+                self._mouse_callback,
+                kernel.GetModuleHandleW(None),
+                0,
             )
             if not self._mouse_hook_handle:
                 raise ctypes.WinError(ctypes.get_last_error())
@@ -827,7 +1094,7 @@ class UsageWidget:
                     break
         except Exception as exc:
             self._hook_error = exc
-            record_error("mouse_hook_failed")
+            self._on_mouse_hook_error(exc)
         finally:
             if self._mouse_hook_handle:
                 api.UnhookWindowsHookEx(self._mouse_hook_handle)
@@ -851,9 +1118,12 @@ class UsageWidget:
                 return self._input_api.CallNextHookEx(None, code, message, data)
             if message == 0x204:  # WM_RBUTTONDOWN
                 rect = _Rect()
-                if (self._input_api.IsWindowVisible(self._input_hwnd)
-                        and self._input_api.GetWindowRect(self._input_hwnd, ctypes.byref(rect))
-                        and rect.left <= x < rect.right and rect.top <= y < rect.bottom):
+                if (
+                    self._input_api.IsWindowVisible(self._input_hwnd)
+                    and self._input_api.GetWindowRect(self._input_hwnd, ctypes.byref(rect))
+                    and rect.left <= x < rect.right
+                    and rect.top <= y < rect.bottom
+                ):
                     self._right_captured = True
                     self._mouse_events.put(("down", x, y))
                     return 1
@@ -905,16 +1175,14 @@ class UsageWidget:
         self.root.geometry(f"+{x}+{y}")
 
     def _show_menu(self, x: int, y: int) -> None:
-        if self._diagnostics is not None:
-            self._diagnostics.log.info("Topmost action: menu opening")
+        self._log_topmost_action("Topmost action: menu opening")
         self._update_connection_status()
         self.menu.show(x, y)
         self._menu_hwnd = self._input_api.GetAncestor(self.menu.window.winfo_id(), 2)
         self._menu_open = True
 
     def _menu_closed(self) -> None:
-        if self._diagnostics is not None:
-            self._diagnostics.log.info("Topmost action: menu closed")
+        self._log_topmost_action("Topmost action: menu closed")
         self._menu_open = False
         self._menu_hwnd = None
 
@@ -923,8 +1191,7 @@ class UsageWidget:
             self._stop_mouse_hook()
 
     def _toggle_topmost(self) -> None:
-        if self._diagnostics is not None:
-            self._diagnostics.log.info("Topmost action: option=%s", self.always_on_top.get())
+        self._log_topmost_action("Topmost action: option=%s", self.always_on_top.get())
         self.root.attributes("-topmost", self.always_on_top.get())
 
     def _set_transparency(self, value: int) -> None:
@@ -935,8 +1202,7 @@ class UsageWidget:
         alpha = 1.0 - max(0, min(100, value)) / 100
         if self._hovered and self.hover_transparency_enabled.get():
             alpha = 0.2
-        if self._diagnostics is not None:
-            self._diagnostics.log.info("Topmost action: alpha=%s hovered=%s", alpha, self._hovered)
+        self._log_topmost_action("Topmost action: alpha=%s hovered=%s", alpha, self._hovered)
         self.root.attributes("-alpha", alpha)
 
     def _toggle_hover_transparency(self) -> None:
@@ -949,8 +1215,10 @@ class UsageWidget:
             return
         x, y = self.root.winfo_pointerxy()
         left, top = self.root.winfo_rootx(), self.root.winfo_rooty()
-        hovered = (left <= x < left + self.root.winfo_width()
-                   and top <= y < top + self.root.winfo_height())
+        hovered = (
+            left <= x < left + self.root.winfo_width()
+            and top <= y < top + self.root.winfo_height()
+        )
         if hovered != self._hovered:
             self._hovered = hovered
             self._apply_transparency(self.transparency.get())
@@ -958,20 +1226,13 @@ class UsageWidget:
 
     def _toggle_autostart(self) -> None:
         try:
-            set_autostart(self.autostart.get())
+            set_autostart_for(self.RUN_VALUE, self._script_path, self.autostart.get())
         except OSError as exc:
-            self.autostart.set(autostart_enabled())
-            messagebox.showerror("ChatGPT Usage", f"Windows 시작 시 자동 실행 설정을 변경하지 못했습니다.\n{exc}")
-
-    def _open_chatgpt(self) -> None:
-        try:
-            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            executables = find_codex_executables()
-            if not executables:
-                raise OSError("Codex executable not found")
-            subprocess.Popen([executables[0], "app"], creationflags=creation_flags)
-        except OSError:
-            webbrowser.open("https://chatgpt.com/")
+            self.autostart.set(autostart_enabled_for(self.RUN_VALUE, self._script_path))
+            messagebox.showerror(
+                self.APP_TITLE,
+                f"Windows 시작 시 자동 실행 설정을 변경하지 못했습니다.\n{exc}",
+            )
 
     def _draw_segments(self, canvas: tk.Canvas, used_percent: int | None) -> None:
         canvas.delete("all")
@@ -985,260 +1246,9 @@ class UsageWidget:
             fill = color if index < active else TRACK
             canvas.create_rectangle(x, 2, x + segment_width, 8, fill=fill, outline="")
 
-    def refresh(self) -> None:
-        if self.refreshing or self.resetting:
-            return
-        self.refreshing = True
-        self.fetch_generation += 1
-        generation = self.fetch_generation
-        self.menu.entryconfigure(0, state="disabled")
-        self._update_connection_status()
-        self._update_reset_menu()
-        if self.snapshot is None:
-            self.reset_compact.configure(text="…", fg=MUTED)
-        threading.Thread(target=self._fetch_worker, args=(generation,), daemon=True).start()
-        self.root.after(50_000, lambda: self._fetch_watchdog(generation))
-
-    def _fetch_worker(self, generation: int) -> None:
-        for delay in (0.0, 2.0):
-            if delay:
-                time.sleep(delay)
-            try:
-                self.results.put((generation, "ok", query_usage(timeout=18.0)))
-                return
-            except Exception:
-                continue
-        self.results.put((generation, "error", None))
-
-    def _fetch_watchdog(self, generation: int) -> None:
-        if not self.refreshing or generation != self.fetch_generation:
-            return
-        self.fetch_generation += 1  # Ignore a late result from the stuck worker.
-        self.refreshing = False
-        self.menu.entryconfigure(0, state="normal")
-        self._handle_connection_error()
-
-    def _drain_results(self) -> None:
-        try:
-            generation, kind, payload = self.results.get_nowait()
-        except queue.Empty:
-            self.root.after(500, self._drain_results)
-            return
-        if generation != self.fetch_generation:
-            self.root.after(500, self._drain_results)
-            return
-        self.refreshing = False
-        self.menu.entryconfigure(0, state="normal")
-        if kind == "ok" and isinstance(payload, UsageSnapshot):
-            if self.recovery_after_id is not None:
-                self.root.after_cancel(self.recovery_after_id)
-                self.recovery_after_id = None
-            self.connection_failed = False
-            self.failure_count = 0
-            self.snapshot = payload
-            self._update_connection_status()
-            self._render(payload)
-        else:
-            self._handle_connection_error()
-        self.root.after(500, self._drain_results)
-
-    def _handle_connection_error(self) -> None:
-        self.connection_failed = True
-        self._update_connection_status()
-        self._update_reset_menu()
-        self.failure_count += 1
-        record_error("usage_refresh_failed")
-        self._render_connection_issue()
-        if self.recovery_after_id is None:
-            delay = recovery_delay(self.failure_count)
-            self.recovery_after_id = self.root.after(delay * 1000, self._recovery_refresh)
-
-    def _render_connection_issue(self) -> None:
-        if not self.connection_failed:
-            return
-        if self.snapshot is not None and self.failure_count < 3:
-            self.reset_compact.configure(text="retry", fg=YELLOW)
-        else:
-            self.reset_compact.configure(text="offline", fg=RED)
-        self._fit_content_width()
-
-    def _update_connection_status(self) -> None:
-        """Display cached query state without starting a connection check."""
-        if self.refreshing:
-            status = "조회 중"
-        elif self.connection_failed:
-            status = "재연결 중"
-        elif self.snapshot is not None:
-            status = "정상"
-        else:
-            status = "확인 전"
-        self.menu.entryconfigure(self.connection_status_index, label=f"연결 상태: {status}")
-
     def _recovery_refresh(self) -> None:
         self.recovery_after_id = None
         self.refresh()
-
-    def _update_reset_menu(self) -> None:
-        count = self.snapshot.reset_credit_count if self.snapshot else None
-        expires_at = self.snapshot.reset_credit_expires_at if self.snapshot else None
-        expiry = ""
-        if count:
-            try:
-                expiry = (f"~{datetime.fromtimestamp(expires_at):%m.%d.}"
-                          if expires_at is not None else "만료일 조회 불가")
-            except (OverflowError, OSError, ValueError):
-                expiry = "만료일 조회 불가"
-        self.menu.entryconfigure(
-            self.reset_count_index,
-            label=f"사용량 리셋권: {count}개" if count is not None else "사용량 리셋권: 조회 불가",
-            right_text=expiry,
-        )
-        retry = self.pending_reset is not None
-        can_start = (not self.connection_failed and self.snapshot is not None
-                     and self.snapshot.reset_credit_id is not None
-                     and self.snapshot.executable is not None)
-        enabled = (not self.resetting and not self.refreshing and not self.reset_state_unreadable
-                   and (retry or can_start))
-        label = "리셋권 사용 결과 재확인" if retry else "리셋권 사용하기"
-        if self.resetting:
-            label = "리셋권 사용 처리 중…"
-        elif self.reset_state_unreadable:
-            label = "리셋권 사용 불가 (요청 기록 확인 필요)"
-        elif count and not retry and not can_start and not self.connection_failed:
-            label = "리셋권 사용 불가 (대상 확인 필요)"
-        self.menu.entryconfigure(self.reset_use_index, label=label,
-                                 state="normal" if enabled else "disabled")
-
-    def _use_reset_credit(self) -> None:
-        if self.resetting or self.refreshing or self.reset_state_unreadable:
-            return
-        request = self.pending_reset
-        snapshot = self.snapshot
-        if request is None:
-            if (self.connection_failed or snapshot is None or not snapshot.reset_credit_id
-                    or not snapshot.executable):
-                return
-            request = PendingReset(str(uuid.uuid4()), snapshot.executable, snapshot.reset_credit_id)
-        retry = self.pending_reset is not None
-        prompt = (
-            "이전 리셋권 사용 요청의 결과를 같은 요청 키로 다시 확인합니다.\n계속하시겠습니까?"
-            if retry else
-            "사용량 리셋권 1개를 사용하시겠습니까? 만료가 있는 권리부터 사용합니다.\n\n"
-            "초기화 대상 기간은 서버가 결정하며, 주간 사용량만 지정할 수는 없습니다."
-        )
-        if not messagebox.askyesno("사용량 리셋권", prompt, parent=self.root):
-            return
-        # Tk modal dialogs keep timers running, including scheduled refreshes.
-        if self.resetting or self.refreshing:
-            messagebox.showinfo("사용량 리셋권", "조회가 끝난 뒤 다시 선택해 주세요.", parent=self.root)
-            return
-        if not retry and (self.connection_failed or self.snapshot is not snapshot
-                          or self.pending_reset is not None):
-            return
-        if not retry:
-            try:
-                save_pending_reset(request)
-            except OSError:
-                record_error("pending_reset_save_failed")
-                messagebox.showwarning("사용량 리셋권", "요청 기록을 저장하지 못했습니다.", parent=self.root)
-                return
-            self.pending_reset = request
-        elif self.pending_reset != request:
-            return
-        self.resetting = True
-        self.menu.entryconfigure(0, state="disabled")
-        self._update_reset_menu()
-        threading.Thread(target=self._reset_worker,
-                         args=(request,), daemon=True).start()
-
-    def _reset_worker(self, request: PendingReset) -> None:
-        try:
-            self.reset_results.put(("ok", consume_reset_credit(request.key, request.executable, request.credit_id)))
-        except Exception:
-            record_error("reset_request_failed")
-            self.reset_results.put(("error", ""))
-
-    def _drain_reset_results(self) -> None:
-        try:
-            kind, payload = self.reset_results.get_nowait()
-        except queue.Empty:
-            self.root.after(500, self._drain_reset_results)
-            return
-        self.resetting = False
-        self.menu.entryconfigure(0, state="normal")
-        if kind == "ok":
-            try:
-                save_pending_reset(None)
-            except OSError:
-                record_error("pending_reset_clear_failed")
-            else:
-                self.pending_reset = None
-            messages = {
-                "reset": "리셋권 1개를 사용했습니다. 사용량과 남은 개수를 다시 조회합니다.",
-                "alreadyRedeemed": "이 요청은 이미 처리되었습니다. 사용량과 남은 개수를 다시 조회합니다.",
-                "nothingToReset": "현재 초기화할 수 있는 사용량 기간이 없습니다.",
-                "noCredit": "사용 가능한 리셋권이 없습니다.",
-            }
-            self.refresh()
-            messagebox.showinfo("사용량 리셋권", messages[str(payload)], parent=self.root)
-        else:
-            self._update_reset_menu()
-            messagebox.showwarning(
-                "사용량 리셋권",
-                "리셋권 사용 결과를 확인하지 못했습니다.\n\n"
-                "‘리셋권 사용 결과 재확인’에서 같은 리셋권과 요청 키로 확인할 수 있습니다.",
-                parent=self.root,
-            )
-        self.root.after(500, self._drain_reset_results)
-
-    def _render(self, snapshot: UsageSnapshot) -> None:
-        primary = snapshot.primary
-        if primary:
-            color = usage_color(primary.used_percent)
-            self.five_title.configure(fg=color)
-            self.five_label.configure(text=f"{primary.used_percent}%", fg=color)
-            self.reset_compact.configure(text=reset_short(primary.resets_at), fg=MUTED)
-            self.root.after_idle(
-                lambda: self._draw_segments(
-                    self.five_meter, primary.used_percent
-                )
-            )
-        else:
-            self.five_title.configure(fg=TEXT)
-            self.five_label.configure(text="—%", fg=TEXT)
-            self.reset_compact.configure(text="—", fg=MUTED)
-            self._draw_segments(self.five_meter, None)
-
-        secondary = snapshot.secondary
-        self.week_reset.configure(
-            text=reset_short(secondary.resets_at if secondary else None)
-        )
-        if secondary:
-            secondary_color = usage_color(secondary.used_percent)
-            self.week_title.configure(fg=secondary_color)
-            self.week_label.configure(text=f"{secondary.used_percent}%", fg=secondary_color)
-            self.root.after_idle(
-                lambda: self._draw_segments(
-                    self.week_meter, secondary.used_percent
-                )
-            )
-        else:
-            self.week_title.configure(fg=TEXT)
-            self.week_label.configure(text="—%", fg=TEXT)
-            self._draw_segments(self.week_meter, None)
-
-        self.menu.entryconfigure(self.account_index, label=f"계정: {snapshot.account or '—'}")
-        plan_text = snapshot.plan if snapshot.plan.lower() != "unknown" else "—"
-        if snapshot.unlimited_credits:
-            credit_text = "무제한"
-        elif snapshot.credit_balance is not None:
-            credit_text = f"{snapshot.credit_balance.quantize(Decimal('0.01'))}"
-        else:
-            credit_text = "—"
-        self.menu.entryconfigure(self.plan_index, label=f"요금제: {plan_text}",
-                                 right_text=f"크레딧: {credit_text}")
-        self._update_reset_menu()
-        self._fit_content_width()
 
     def _update_clock(self) -> None:
         if self.snapshot:
@@ -1252,35 +1262,3 @@ class UsageWidget:
 
     def run(self) -> None:
         self.root.mainloop()
-
-
-def main() -> None:
-    if os.name != "nt":
-        raise SystemExit("이 위젯은 Windows에서만 실행할 수 있습니다.")
-
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
-    kernel.CreateMutexW.restype = wintypes.HANDLE
-    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel.CloseHandle.restype = wintypes.BOOL
-
-    error_already_exists = 183
-    ctypes.set_last_error(0)
-    mutex = kernel.CreateMutexW(None, False, r"Local\CodexUsageMiniWidget")
-    error = ctypes.get_last_error()
-    if not mutex:
-        raise ctypes.WinError(error)
-
-    if error == error_already_exists:
-        kernel.CloseHandle(mutex)
-        messagebox.showinfo("Codex 사용량 위젯", "위젯이 이미 실행 중입니다.")
-        return
-
-    try:
-        UsageWidget().run()
-    finally:
-        kernel.CloseHandle(mutex)
-
-
-if __name__ == "__main__":
-    main()
