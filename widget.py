@@ -153,10 +153,12 @@ def reset_short(timestamp: int | None) -> str:
         return "now"
     # Round up to minutes so a positive remainder never appears as zero.
     total_minutes = (seconds + 59) // 60
+    if total_minutes == 1440:
+        return "24h 0m"
     days, remainder = divmod(total_minutes, 1440)
     hours, minutes = divmod(remainder, 60)
     if days:
-        return f"{days}d {hours}h {minutes}m"
+        return f"{days}d {hours}h"
     if hours:
         return f"{hours}h {minutes}m"
     return f"{minutes}m"
@@ -164,17 +166,6 @@ def reset_short(timestamp: int | None) -> str:
 
 def usage_color(used_percent: int) -> str:
     return gradient_color(max(0.0, min(1.0, used_percent / 100)))
-
-
-def weekly_reset_date(timestamp: int | None) -> str:
-    """Format the server's weekly reset timestamp in the PC's local time."""
-    if timestamp is None:
-        return "—"
-    try:
-        reset = datetime.fromtimestamp(timestamp)
-    except (OverflowError, OSError, ValueError):
-        return "—"
-    return f"{reset:%m.%d.}"
 
 
 def _rgb(hex_color: str) -> tuple[int, int, int]:
@@ -576,13 +567,6 @@ class UsageWidget:
 
         percent_font = tkfont.Font(self.root, family="NEXON Football Gothic B", size=9)
         reset_font = tkfont.Font(self.root, family=FONT_FAMILY, size=9)
-        weekly_dates = (
-            f"{month:02d}.{day:02d}."
-            for month, month_days in enumerate((31, 29, 31, 30, 31, 30,
-                                                31, 31, 30, 31, 30, 31), start=1)
-            for day in range(1, month_days + 1)
-        )
-        widest_weekly_date = max(weekly_dates, key=reset_font.measure)
 
         def add_right_aligned_label(text: str, max_text: str, color: str,
                                     font: tkfont.Font,
@@ -592,16 +576,37 @@ class UsageWidget:
             column.pack_propagate(False)
             label = tk.Label(
                 column, text=text, anchor="e", padx=0, pady=0,
+                bd=0, highlightthickness=0,
                 fg=color, bg=BG, font=font,
             )
             label.pack(fill="both", expand=True)
             column.pack(side="left", padx=padx)
             return label
 
-        self.five_label = add_right_aligned_label(
-            "5H —%", "5H 100%", TEXT, percent_font,
+        def add_metric_labels(title: str, value: str, max_text: str, color: str,
+                              font: tkfont.Font,
+                              padx: tuple[int, int] = (1, 0)) -> tuple[tk.Label, tk.Label]:
+            column = tk.Frame(header, width=font.measure(max_text), height=18, bg=BG)
+            column.pack_propagate(False)
+            title_label = tk.Label(
+                column, text=title, anchor="w", padx=0, pady=0,
+                bd=0, highlightthickness=0,
+                fg=color, bg=BG, font=font,
+            )
+            title_label.pack(side="left", fill="y")
+            value_label = tk.Label(
+                column, text=value, anchor="e", padx=0, pady=0,
+                bd=0, highlightthickness=0,
+                fg=color, bg=BG, font=font,
+            )
+            value_label.pack(side="left", fill="both", expand=True)
+            column.pack(side="left", padx=padx)
+            return title_label, value_label
+
+        self.five_title, self.five_label = add_metric_labels(
+            "5H", "—%", "5H 100%", TEXT, percent_font,
         )
-        self.five_meter = tk.Canvas(header, width=28, height=10, bg=BG, bd=0, highlightthickness=0)
+        self.five_meter = tk.Canvas(header, width=23, height=10, bg=BG, bd=0, highlightthickness=0)
         self.five_meter.pack(side="left", padx=(3, 5))
         self.reset_compact = add_right_aligned_label(
             "—", "5h 59m", MUTED, reset_font, padx=(0, 8),
@@ -609,13 +614,13 @@ class UsageWidget:
 
         tk.Frame(header, bg="#56525F", width=1, height=18).pack(side="left", padx=(0, 5))
 
-        self.week_label = add_right_aligned_label(
-            "WK —%", "WK 100%", TEXT, percent_font,
+        self.week_title, self.week_label = add_metric_labels(
+            "WK", "—%", "WK 100%", TEXT, percent_font,
         )
-        self.week_meter = tk.Canvas(header, width=28, height=10, bg=BG, bd=0, highlightthickness=0)
+        self.week_meter = tk.Canvas(header, width=23, height=10, bg=BG, bd=0, highlightthickness=0)
         self.week_meter.pack(side="left", padx=(3, 5))
         self.week_reset = add_right_aligned_label(
-            "—", widest_weekly_date, MUTED, reset_font,
+            "—", "7d 23h", MUTED, reset_font,
         )
 
         self.menu = PopupMenu(self.root, self._menu_closed)
@@ -970,7 +975,7 @@ class UsageWidget:
 
     def _draw_segments(self, canvas: tk.Canvas, used_percent: int | None) -> None:
         canvas.delete("all")
-        count = 6
+        count = 5
         segment_width = 3
         gap = 2
         active = 0 if used_percent is None else round(count * used_percent / 100)
@@ -1190,7 +1195,8 @@ class UsageWidget:
         primary = snapshot.primary
         if primary:
             color = usage_color(primary.used_percent)
-            self.five_label.configure(text=f"5H {primary.used_percent}%", fg=color)
+            self.five_title.configure(fg=color)
+            self.five_label.configure(text=f"{primary.used_percent}%", fg=color)
             self.reset_compact.configure(text=reset_short(primary.resets_at), fg=MUTED)
             self.root.after_idle(
                 lambda: self._draw_segments(
@@ -1198,24 +1204,27 @@ class UsageWidget:
                 )
             )
         else:
-            self.five_label.configure(text="5H —%", fg=TEXT)
+            self.five_title.configure(fg=TEXT)
+            self.five_label.configure(text="—%", fg=TEXT)
             self.reset_compact.configure(text="—", fg=MUTED)
             self._draw_segments(self.five_meter, None)
 
         secondary = snapshot.secondary
         self.week_reset.configure(
-            text=weekly_reset_date(secondary.resets_at if secondary else None)
+            text=reset_short(secondary.resets_at if secondary else None)
         )
         if secondary:
             secondary_color = usage_color(secondary.used_percent)
-            self.week_label.configure(text=f"WK {secondary.used_percent}%", fg=secondary_color)
+            self.week_title.configure(fg=secondary_color)
+            self.week_label.configure(text=f"{secondary.used_percent}%", fg=secondary_color)
             self.root.after_idle(
                 lambda: self._draw_segments(
                     self.week_meter, secondary.used_percent
                 )
             )
         else:
-            self.week_label.configure(text="WK —%", fg=TEXT)
+            self.week_title.configure(fg=TEXT)
+            self.week_label.configure(text="—%", fg=TEXT)
             self._draw_segments(self.week_meter, None)
 
         self.menu.entryconfigure(self.account_index, label=f"계정: {snapshot.account or '—'}")

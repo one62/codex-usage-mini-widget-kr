@@ -15,7 +15,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from codex_usage import UsageError, find_codex_executables, parse_rate_limits
-from widget import UsageWidget, _MouseHookData, _Rect, enable_dpi_awareness, clamp_position, gradient_color, recovery_delay
+from widget import FONT_FAMILY, UsageWidget, _MouseHookData, _Rect, enable_dpi_awareness, clamp_position, gradient_color, load_bundled_fonts, recovery_delay
 
 
 class ParseRateLimitsTests(unittest.TestCase):
@@ -82,6 +82,58 @@ class ParseRateLimitsTests(unittest.TestCase):
 
     def test_recovery_backoff_is_bounded(self):
         self.assertEqual([recovery_delay(value) for value in range(1, 7)], [15, 30, 60, 120, 300, 300])
+
+    @unittest.skipUnless(os.name == "nt", "Requires Windows Tk font metrics")
+    def test_fixed_titles_and_zero_border_right_aligned_labels(self):
+        enable_dpi_awareness()
+        load_bundled_fonts()
+        widget = UsageWidget.__new__(UsageWidget)
+        widget.root = tk.Tk()
+        widget.root.withdraw()
+        try:
+            widget.transparency = tk.IntVar(master=widget.root, value=30)
+            widget.movement_locked = tk.BooleanVar(master=widget.root, value=False)
+            widget.hover_transparency_enabled = tk.BooleanVar(master=widget.root, value=True)
+            widget.always_on_top = tk.BooleanVar(master=widget.root, value=True)
+            widget.autostart = tk.BooleanVar(master=widget.root, value=False)
+            widget._build()
+
+            self.assertEqual(int(widget.five_meter.cget("width")), 23)
+            self.assertEqual(int(widget.week_meter.cget("width")), 23)
+
+            for title, label, expected_title in (
+                (widget.five_title, widget.five_label, "5H"),
+                (widget.week_title, widget.week_label, "WK"),
+            ):
+                self.assertEqual(label.master.pack_info()["padx"], (1, 0))
+                self.assertEqual(title.cget("text"), expected_title)
+                self.assertEqual(title.cget("anchor"), "w")
+                self.assertEqual(int(title.cget("bd")), 0)
+                self.assertEqual(int(title.cget("highlightthickness")), 0)
+                self.assertEqual(label.cget("anchor"), "e")
+                self.assertEqual(int(label.cget("bd")), 0)
+                self.assertEqual(int(label.cget("highlightthickness")), 0)
+                label.configure(text="100%")
+                widget.root.update_idletasks()
+                self.assertLessEqual(
+                    title.winfo_reqwidth() + label.winfo_reqwidth(),
+                    int(label.master.cget("width")),
+                )
+
+            for label, sample in (
+                (widget.reset_compact, "4h 58m"),
+                (widget.week_reset, "6d 23h"),
+            ):
+                self.assertEqual(int(label.cget("bd")), 0)
+                self.assertEqual(int(label.cget("highlightthickness")), 0)
+                label.configure(text=sample)
+                widget.root.update_idletasks()
+                self.assertLessEqual(
+                    label.winfo_reqwidth(),
+                    int(label.master.cget("width")),
+                )
+        finally:
+            widget.root.destroy()
 
 
 class MouseGestureTests(unittest.TestCase):
