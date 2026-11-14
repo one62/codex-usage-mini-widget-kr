@@ -28,7 +28,13 @@ from common.widget_base import (
     run_single_instance,
     usage_color,
 )
-from codex_usage import UsageSnapshot, consume_reset_credit, find_codex_executables, query_usage
+from codex_usage import (
+    AuthRequiredError,
+    UsageSnapshot,
+    consume_reset_credit,
+    find_codex_executables,
+    query_usage,
+)
 from widget_settings import (
     PendingReset,
     load_pending_reset,
@@ -76,6 +82,12 @@ class UsageWidget(BaseUsageWidget):
     def _query_usage(self, timeout: float = 18.0) -> UsageSnapshot:
         return query_usage(timeout=timeout)
 
+    def _is_non_retryable_fetch_error(self, exc: Exception) -> bool:
+        return isinstance(exc, AuthRequiredError)
+
+    def _open_app(self) -> None:
+        self._open_chatgpt()
+
     def _build(self) -> None:
         logo_path = Path(__file__).resolve().parent / "assets" / "codex-logo.png"
         self._build_header_shell(
@@ -86,7 +98,7 @@ class UsageWidget(BaseUsageWidget):
 
         self.menu = PopupMenu(self.root, self._menu_closed)
         self.menu.add_command(label="지금 새로고침", command=self.refresh)
-        self.menu.add_info(label="연결 상태: 확인 전")
+        self.menu.add_command(label="연결 상태: 확인 전", command=self._open_app, state="disabled")
         self.connection_status_index = self.menu.index("end")
         self.menu.add_separator()
         self.menu.add_info(label="계정: —")

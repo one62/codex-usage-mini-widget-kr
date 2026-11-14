@@ -676,6 +676,9 @@ class BaseUsageWidget:
     def _is_non_retryable_fetch_error(self, exc: Exception) -> bool:
         return False
 
+    def _open_app(self) -> None:
+        pass
+
     def _render(self, snapshot) -> None:
         raise NotImplementedError
 
@@ -750,11 +753,14 @@ class BaseUsageWidget:
         self.connection_failed = True
         self.last_error = message or "connection failed"
         self.auth_required = auth_required
+        if auth_required and self.recovery_after_id is not None:
+            self.root.after_cancel(self.recovery_after_id)
+            self.recovery_after_id = None
         self._update_connection_status()
         self._on_refresh_state_changed()
         self.failure_count += 1
         self._render_connection_issue()
-        if self.recovery_after_id is None:
+        if not auth_required and self.recovery_after_id is None:
             delay = recovery_delay(self.failure_count)
             self.recovery_after_id = self.root.after(delay * 1000, self._recovery_refresh)
 
@@ -769,21 +775,26 @@ class BaseUsageWidget:
             self.reset_compact.configure(text="retry", fg=YELLOW)
         else:
             self.reset_compact.configure(text="offline", fg=MUTED)
-        self._fit_content_width()
 
     def _update_connection_status(self) -> None:
         """Display cached query state without starting a connection check."""
+        auth_clickable = False
         if self.refreshing:
             status = "조회 중"
         elif getattr(self, "auth_required", False):
             status = "로그인 필요"
+            auth_clickable = True
         elif getattr(self, "connection_failed", False) or getattr(self, "last_error", ""):
             status = "재연결 중"
         elif self.snapshot is not None:
             status = "정상"
         else:
             status = "확인 전"
-        self.menu.entryconfigure(self.connection_status_index, label=f"연결 상태: {status}")
+        self.menu.entryconfigure(
+            self.connection_status_index,
+            label=f"연결 상태: {status}",
+            state="normal" if auth_clickable else "disabled",
+        )
 
     def _build_header_shell(
         self,
@@ -1005,8 +1016,16 @@ class BaseUsageWidget:
     def _apply_rounded_corners(self) -> None:
         """Ask Windows 11 DWM for iOS-like rounded top-level corners."""
         try:
+            dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+            dwmapi.DwmSetWindowAttribute.argtypes = [
+                wintypes.HWND,
+                wintypes.DWORD,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+            ]
+            dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
             preference = ctypes.c_int(2)  # DWMWCP_ROUND
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            dwmapi.DwmSetWindowAttribute(
                 self.root.winfo_id(),
                 33,
                 ctypes.byref(preference),

@@ -19,8 +19,8 @@ class UsageError(RuntimeError):
     """Raised when the local Codex app server cannot return usage data."""
 
 
-class _UsageAuthError(UsageError):
-    """An app-server error that can be retried after refreshing auth."""
+class AuthRequiredError(UsageError):
+    """Raised when Codex authentication is missing or expired."""
 
 
 @dataclass(frozen=True)
@@ -195,8 +195,8 @@ def _wait_for_id(reader: _LineReader, request_id: int, deadline: float) -> dict[
             if isinstance(detail, dict):
                 detail = detail.get("message") or detail
             error_text = str(detail).lower()
-            if any(word in error_text for word in ("auth", "token", "401", "unauthor")):
-                raise _UsageAuthError("Codex 인증을 확인할 수 없습니다.")
+            if any(word in error_text for word in ("auth", "token", "401", "unauthor", "login", "sign in")):
+                raise AuthRequiredError("Codex 인증을 확인할 수 없습니다. Codex에서 로그인 상태를 확인해 주세요.")
             raise UsageError("Codex App Server가 요청을 처리하지 못했습니다.")
         result = message.get("result")
         if not isinstance(result, dict):
@@ -316,12 +316,14 @@ def _query_with_executable(executable: str, timeout: float,
         _send(process, {"id": 2, "method": "account/rateLimits/read"})
         try:
             result = _wait_for_id(reader, 2, deadline)
-        except _UsageAuthError:
+        except AuthRequiredError:
             _send(
                 process,
                 {"id": 3, "method": "account/read", "params": {"refreshToken": True}},
             )
-            _wait_for_id(reader, 3, deadline)
+            refresh_result = _wait_for_id(reader, 3, deadline)
+            if refresh_result.get("account") is None and refresh_result.get("requiresOpenaiAuth"):
+                raise AuthRequiredError("Codex 로그인이 필요합니다. Codex에서 로그인해 주세요.")
             _send(process, {"id": 4, "method": "account/rateLimits/read"})
             result = _wait_for_id(reader, 4, deadline)
         snapshot = parse_rate_limits(result)
@@ -370,6 +372,7 @@ def query_usage(timeout: float = 15.0) -> UsageSnapshot:
         raise UsageError("Codex 실행 파일을 찾을 수 없습니다. Codex Desktop을 실행하거나 설치한 뒤 다시 시도해 주세요.")
 
     errors: list[str] = []
+    saw_auth_error = False
     for executable in executables:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -379,9 +382,14 @@ def query_usage(timeout: float = 15.0) -> UsageSnapshot:
             if not isinstance(snapshot, UsageSnapshot):
                 raise UsageError("Codex 사용량 응답 형식이 올바르지 않습니다.")
             return replace(snapshot, executable=executable)
+        except AuthRequiredError as exc:
+            saw_auth_error = True
+            errors.append(str(exc))
         except UsageError as exc:
             errors.append(str(exc))
 
+    if saw_auth_error:
+        raise AuthRequiredError(errors[-1])
     detail = errors[-1] if errors else "알 수 없는 오류"
     raise UsageError(f"Codex에 연결하지 못했습니다: {detail}")
 

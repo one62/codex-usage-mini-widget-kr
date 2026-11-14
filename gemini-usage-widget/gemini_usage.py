@@ -640,9 +640,9 @@ def _call_language_server_rpc(
                     raise UsageError("Antigravity 상태 응답 형식이 올바르지 않습니다.")
                 return parsed
             except urllib.error.HTTPError as exc:
+                exc.close()
                 last_exc = exc
                 if exc.code == 400 and body is not bodies[-1]:
-                    exc.close()
                     continue
                 raise
             except (urllib.error.URLError, OSError) as exc:
@@ -1280,6 +1280,7 @@ def _fetch_endpoint_payloads(
             else:
                 status_payload = result
         except urllib.error.HTTPError as exc:
+            exc.close()
             last_exc = exc
         except Exception as exc:
             last_exc = exc
@@ -1342,6 +1343,8 @@ def query_usage(timeout: float = 15.0) -> UsageSnapshot:
             )
             if _has_weekly_limits(snapshot):
                 return snapshot
+        except urllib.error.HTTPError as exc:
+            exc.close()
         except Exception:
             pass
         with _CACHE_LOCK:
@@ -1397,6 +1400,7 @@ def query_usage(timeout: float = 15.0) -> UsageSnapshot:
                     # Stop trying http on the same port once https succeeded, and check next port/process.
                     break
                 except urllib.error.HTTPError as exc:
+                    exc.close()
                     if exc.code in (401, 403):
                         saw_auth_error = True
                     last_error = exc
