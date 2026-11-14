@@ -131,7 +131,7 @@ def monitor_work_area(x: int, y: int, width: int, height: int) -> tuple[int, int
     return (0, 0, ctypes.windll.user32.GetSystemMetrics(0), ctypes.windll.user32.GetSystemMetrics(1))
 
 
-def reset_short(timestamp: int | None) -> str:
+def reset_short(timestamp: int | None, *, weekly: bool = False) -> str:
     if timestamp is None:
         return "—"
     seconds = max(0, timestamp - int(time.time()))
@@ -139,10 +139,12 @@ def reset_short(timestamp: int | None) -> str:
         return "now"
     # Round up to minutes so a positive remainder never appears as zero.
     total_minutes = (seconds + 59) // 60
-    if total_minutes == 1440:
-        return "24h 0m"
     days, remainder = divmod(total_minutes, 1440)
     hours, minutes = divmod(remainder, 60)
+    if weekly:
+        return f"{days}d {hours}h"
+    if total_minutes == 1440:
+        return "24h 0m"
     if days:
         return f"{days}d {hours}h"
     if hours:

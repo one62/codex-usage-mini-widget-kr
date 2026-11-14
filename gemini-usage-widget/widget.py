@@ -289,7 +289,7 @@ class UsageWidget(BaseUsageWidget):
         if self.snapshot is not None and self.failure_count < 3 and not self.auth_required:
             self.reset_compact.configure(text="retry", fg=YELLOW)
         else:
-            self.reset_compact.configure(text="—", fg=MUTED)
+            self.reset_compact.configure(text="offline", fg=MUTED)
         self._fit_content_width()
 
     def _update_connection_status(self) -> None:
@@ -320,7 +320,9 @@ class UsageWidget(BaseUsageWidget):
             self._draw_segments(self.five_meter, None)
 
         week = snapshot.seven_day
-        self.week_reset.configure(text=reset_short(week.resets_at if week else None))
+        self.week_reset.configure(
+            text=reset_short(week.resets_at if week else None, weekly=True)
+        )
         if week:
             self.week_label.configure(text=f"{week.used_percent}%", fg=WEEK_TEXT)
             self.root.after_idle(
@@ -358,7 +360,7 @@ class UsageWidget(BaseUsageWidget):
             self.menu.entryconfigure(
                 self.claude_7d_index,
                 label=f"Claude·GPT 주간: {c7.used_percent}%",
-                right_text=reset_short(c7.resets_at) if c7.resets_at is not None else "",
+                right_text=reset_short(c7.resets_at, weekly=True) if c7.resets_at is not None else "",
             )
         else:
             self.menu.entryconfigure(

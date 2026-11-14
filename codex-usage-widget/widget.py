@@ -252,7 +252,7 @@ class UsageWidget(BaseUsageWidget):
         if self.snapshot is not None and self.failure_count < 3:
             self.reset_compact.configure(text="retry", fg=YELLOW)
         else:
-            self.reset_compact.configure(text="offline", fg=RED)
+            self.reset_compact.configure(text="offline", fg=MUTED)
         self._fit_content_width()
 
     def _update_connection_status(self) -> None:
@@ -416,7 +416,9 @@ class UsageWidget(BaseUsageWidget):
             self._draw_segments(self.five_meter, None)
 
         secondary = snapshot.secondary
-        self.week_reset.configure(text=reset_short(secondary.resets_at if secondary else None))
+        self.week_reset.configure(
+            text=reset_short(secondary.resets_at if secondary else None, weekly=True)
+        )
         if secondary:
             secondary_color = usage_color(secondary.used_percent)
             self.week_title.configure(fg=secondary_color)
