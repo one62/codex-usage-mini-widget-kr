@@ -23,7 +23,6 @@ TEXT = "#FFFFFF"
 MUTED = "#C6C3CE"
 TRACK = "#424149"
 YELLOW = "#F9E29C"
-RED = "#F6AEAE"
 GRADIENT_STOPS = (
     (0.00, "#A5E9C1"),
     (0.28, "#A3E1F7"),
@@ -41,10 +40,7 @@ RECOVERY_DELAYS = (15, 30, 60, 120, 300)
 DEFAULT_FONT_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
 
 
-def load_bundled_fonts(
-    font_directory: Path | None = None,
-    on_error: Callable[[str], None] | None = None,
-) -> None:
+def load_bundled_fonts(font_directory: Path | None = None) -> None:
     """Register bundled Nexon Football Gothic fonts privately for this process."""
     target_dir = font_directory or DEFAULT_FONT_DIR
     gdi32 = ctypes.WinDLL("gdi32")
@@ -57,8 +53,6 @@ def load_bundled_fonts(
         path = str(target_dir / filename)
         if gdi32.AddFontResourceExW(path, private_font, None):
             atexit.register(gdi32.RemoveFontResourceExW, path, private_font, None)
-        elif on_error is not None:
-            on_error(path)
 
 
 def recovery_delay(failure_count: int) -> int:
@@ -383,60 +377,6 @@ class PopupMenu:
     def add_info(self, *, label: str, right_text: str | None = None) -> None:
         self._add_row("info", label, "disabled", right_text=right_text)
 
-    def add_dynamic_section(self) -> tk.Frame:
-        container = tk.Frame(self.body, bg=self.background, bd=0)
-        container.pack(fill="x")
-        return container
-
-    def set_dynamic_info_rows(
-        self,
-        container: tk.Frame,
-        rows: list[tuple[str, str | None]],
-    ) -> None:
-        for child in container.winfo_children():
-            child.destroy()
-        for label, right_text in rows:
-            row = tk.Frame(container, bg=self.background, bd=0)
-            row.pack(fill="x")
-            if self.reserve_indicator_space:
-                indicator = tk.Canvas(
-                    row,
-                    width=18,
-                    height=18,
-                    bg=self.background,
-                    bd=0,
-                    highlightthickness=0,
-                )
-                indicator.pack(side="left", padx=(12, 6))
-                left_pad = 0
-            else:
-                left_pad = 12
-            if right_text is not None:
-                tk.Label(
-                    row,
-                    text=right_text,
-                    anchor="e",
-                    padx=0,
-                    pady=6,
-                    bg=self.background,
-                    fg=MUTED,
-                    bd=0,
-                    font=self.font,
-                ).pack(side="right", padx=(8, 12))
-            tk.Label(
-                row,
-                text=label,
-                anchor="w",
-                padx=0,
-                pady=6,
-                bg=self.background,
-                fg=MUTED,
-                bd=0,
-                font=self.font,
-            ).pack(side="left", fill="both", expand=True, padx=(left_pad, 12))
-        if self.open:
-            self._fit_window(self.window.winfo_x(), self.window.winfo_y())
-
     def add_checkbutton(self, *, label: str, variable: tk.BooleanVar, command) -> None:
         self._add_row("check", label, command=command, variable=variable)
 
@@ -667,7 +607,7 @@ class BaseUsageWidget:
 
     def _init_base(self, *, script_path: Path) -> None:
         enable_dpi_awareness()
-        load_bundled_fonts(on_error=self._on_font_load_error)
+        load_bundled_fonts()
         self._script_path = script_path
         self.settings = self._load_widget_settings()
         self._settings_after_id: str | None = None
@@ -695,6 +635,9 @@ class BaseUsageWidget:
         self.fetch_generation = 0
         self.failure_count = 0
         self.recovery_after_id: str | None = None
+        self.connection_failed = False
+        self.last_error = ""
+        self.auth_required = False
         self.always_on_top = tk.BooleanVar(value=True)
         self.autostart = tk.BooleanVar(value=autostart_enabled_for(self.RUN_VALUE, self._script_path))
 
@@ -703,7 +646,6 @@ class BaseUsageWidget:
         self._apply_rounded_corners()
         self._bind_actions()
         self._enable_click_through()
-        self._after_window_ready()
         self._settings_ready = True
         self._update_hover()
         self.refresh()
@@ -713,47 +655,140 @@ class BaseUsageWidget:
         self.root.after(60_000, self._scheduled_refresh)
 
     # Subclass extension points (with safe defaults for partial test instances)
-    def _on_font_load_error(self, path: str) -> None:
-        pass
-
-    def _on_settings_save_error(self, exc: OSError) -> None:
-        pass
-
-    def _on_mouse_hook_error(self, exc: Exception) -> None:
-        pass
-
-    def _log_topmost_action(self, message: str, *args: object) -> None:
-        pass
-
     def _load_widget_settings(self):
         raise NotImplementedError
 
     def _save_widget_settings(self, settings) -> None:
         raise NotImplementedError
 
-    def _after_window_ready(self) -> None:
-        pass
-
     def _start_extra_timers(self) -> None:
         pass
 
-    def _update_connection_status(self) -> None:
+    def _can_start_refresh(self) -> bool:
+        return not self.refreshing
+
+    def _on_refresh_state_changed(self) -> None:
         pass
 
-    def _render_connection_issue(self) -> None:
-        pass
+    def _query_usage(self, timeout: float = 18.0):
+        raise NotImplementedError
+
+    def _is_non_retryable_fetch_error(self, exc: Exception) -> bool:
+        return False
 
     def _render(self, snapshot) -> None:
         raise NotImplementedError
 
     def refresh(self) -> None:
-        raise NotImplementedError
+        if not self._can_start_refresh():
+            return
+        self.refreshing = True
+        self.fetch_generation += 1
+        generation = self.fetch_generation
+        self.menu.entryconfigure(0, state="disabled")
+        self._update_connection_status()
+        self._on_refresh_state_changed()
+        if self.snapshot is None:
+            self.reset_compact.configure(text="…", fg=MUTED)
+        threading.Thread(target=self._fetch_worker, args=(generation,), daemon=True).start()
+        self.root.after(50_000, lambda: self._fetch_watchdog(generation))
+
+    def _fetch_worker(self, generation: int) -> None:
+        last_error: Exception | None = None
+        for delay in (0.0, 2.0):
+            if delay:
+                time.sleep(delay)
+            try:
+                self.results.put((generation, "ok", self._query_usage(timeout=18.0)))
+                return
+            except Exception as exc:
+                if self._is_non_retryable_fetch_error(exc):
+                    self.results.put((generation, "error", exc))
+                    return
+                last_error = exc
+        self.results.put(
+            (generation, "error", last_error or RuntimeError("알 수 없는 오류"))
+        )
+
+    def _fetch_watchdog(self, generation: int) -> None:
+        if not self.refreshing or generation != self.fetch_generation:
+            return
+        self.fetch_generation += 1  # Ignore a late result from the stuck worker.
+        self.refreshing = False
+        self.menu.entryconfigure(0, state="normal")
+        self._handle_connection_error("사용량 조회가 50초를 초과했습니다.")
+
+    def _drain_results(self) -> None:
+        try:
+            generation, kind, payload = self.results.get_nowait()
+        except queue.Empty:
+            self.root.after(500, self._drain_results)
+            return
+        if generation != self.fetch_generation:
+            self.root.after(500, self._drain_results)
+            return
+        self.refreshing = False
+        self.menu.entryconfigure(0, state="normal")
+        if kind == "ok" and payload is not None:
+            if self.recovery_after_id is not None:
+                self.root.after_cancel(self.recovery_after_id)
+                self.recovery_after_id = None
+            self.connection_failed = False
+            self.last_error = ""
+            self.auth_required = False
+            self.failure_count = 0
+            self.snapshot = payload
+            self._update_connection_status()
+            self._render(payload)
+        else:
+            auth_required = isinstance(payload, Exception) and self._is_non_retryable_fetch_error(payload)
+            message = str(payload) if payload else "알 수 없는 오류"
+            self._handle_connection_error(message, auth_required=auth_required)
+        self.root.after(500, self._drain_results)
+
+    def _handle_connection_error(self, message: str = "", *, auth_required: bool = False) -> None:
+        self.connection_failed = True
+        self.last_error = message or "connection failed"
+        self.auth_required = auth_required
+        self._update_connection_status()
+        self._on_refresh_state_changed()
+        self.failure_count += 1
+        self._render_connection_issue()
+        if self.recovery_after_id is None:
+            delay = recovery_delay(self.failure_count)
+            self.recovery_after_id = self.root.after(delay * 1000, self._recovery_refresh)
+
+    def _render_connection_issue(self) -> None:
+        if not getattr(self, "connection_failed", False) and not getattr(self, "last_error", ""):
+            return
+        if (
+            self.snapshot is not None
+            and self.failure_count < 3
+            and not getattr(self, "auth_required", False)
+        ):
+            self.reset_compact.configure(text="retry", fg=YELLOW)
+        else:
+            self.reset_compact.configure(text="offline", fg=MUTED)
+        self._fit_content_width()
+
+    def _update_connection_status(self) -> None:
+        """Display cached query state without starting a connection check."""
+        if self.refreshing:
+            status = "조회 중"
+        elif getattr(self, "auth_required", False):
+            status = "로그인 필요"
+        elif getattr(self, "connection_failed", False) or getattr(self, "last_error", ""):
+            status = "재연결 중"
+        elif self.snapshot is not None:
+            status = "정상"
+        else:
+            status = "확인 전"
+        self.menu.entryconfigure(self.connection_status_index, label=f"연결 상태: {status}")
 
     def _build_header_shell(
         self,
         *,
         logo_path: Path,
-        on_logo_error: Callable[[], None],
         five_fg: str,
         week_fg: str,
     ) -> None:
@@ -769,7 +804,7 @@ class BaseUsageWidget:
             self._logo_image = tk.PhotoImage(master=self.root, file=str(logo_path))
             tk.Label(header, image=self._logo_image, bg=BG, bd=0).pack(side="left", padx=(2, 4))
         except tk.TclError:
-            on_logo_error()
+            pass
 
         percent_font = tkfont.Font(self.root, family=BOLD_FONT_FAMILY, size=9)
         reset_font = tkfont.Font(self.root, family=FONT_FAMILY, size=9)
@@ -947,8 +982,8 @@ class BaseUsageWidget:
         self.settings.x, self.settings.y = self.root.winfo_x(), self.root.winfo_y()
         try:
             self._save_widget_settings(self.settings)
-        except OSError as exc:
-            self._on_settings_save_error(exc)
+        except OSError:
+            pass
 
     def _close(self) -> None:
         if self._closing:
@@ -996,8 +1031,6 @@ class BaseUsageWidget:
             "SetWindowLongW": ([ctypes.c_void_p, ctypes.c_int, ctypes.c_long], ctypes.c_long),
             "GetWindowRect": ([ctypes.c_void_p, ctypes.POINTER(_Rect)], ctypes.c_int),
             "IsWindowVisible": ([ctypes.c_void_p], ctypes.c_int),
-            "GetForegroundWindow": ([], ctypes.c_void_p),
-            "GetWindow": ([ctypes.c_void_p, ctypes.c_uint], ctypes.c_void_p),
             "WindowFromPoint": ([wintypes.POINT], wintypes.HWND),
             "SetWindowsHookExW": (
                 [ctypes.c_int, self._hook_type, ctypes.c_void_p, ctypes.c_ulong],
@@ -1096,7 +1129,6 @@ class BaseUsageWidget:
                     break
         except Exception as exc:
             self._hook_error = exc
-            self._on_mouse_hook_error(exc)
         finally:
             if self._mouse_hook_handle:
                 api.UnhookWindowsHookEx(self._mouse_hook_handle)
@@ -1177,24 +1209,38 @@ class BaseUsageWidget:
         self.root.geometry(f"+{x}+{y}")
 
     def _show_menu(self, x: int, y: int) -> None:
-        self._log_topmost_action("Topmost action: menu opening")
         self._update_connection_status()
         self.menu.show(x, y)
         self._menu_hwnd = self._input_api.GetAncestor(self.menu.window.winfo_id(), 2)
         self._menu_open = True
 
     def _menu_closed(self) -> None:
-        self._log_topmost_action("Topmost action: menu closed")
         self._menu_open = False
         self._menu_hwnd = None
+        self._ensure_topmost()
 
     def _release_mouse_hook(self, event: tk.Event) -> None:
         if event.widget is self.root and hasattr(self, "_hook_thread"):
             self._stop_mouse_hook()
 
     def _toggle_topmost(self) -> None:
-        self._log_topmost_action("Topmost action: option=%s", self.always_on_top.get())
         self.root.attributes("-topmost", self.always_on_top.get())
+
+    def _ensure_topmost(self) -> None:
+        """Restore native WS_EX_TOPMOST if enabled and unexpectedly cleared."""
+        if self._closing or not self.always_on_top.get():
+            return
+        api = getattr(self, "_input_api", None)
+        hwnd = getattr(self, "_input_hwnd", None)
+        if api is None or not hwnd:
+            return
+        try:
+            style = api.GetWindowLongW(hwnd, -20)
+            if style and not (style & 0x8):
+                self.root.attributes("-topmost", True)
+                self.root.lift()
+        except (OSError, tk.TclError):
+            pass
 
     def _set_transparency(self, value: int) -> None:
         self._apply_transparency(value)
@@ -1204,7 +1250,6 @@ class BaseUsageWidget:
         alpha = 1.0 - max(0, min(100, value)) / 100
         if self._hovered and self.hover_transparency_enabled.get():
             alpha = 0.2
-        self._log_topmost_action("Topmost action: alpha=%s hovered=%s", alpha, self._hovered)
         self.root.attributes("-alpha", alpha)
 
     def _toggle_hover_transparency(self) -> None:
@@ -1253,6 +1298,7 @@ class BaseUsageWidget:
         self.refresh()
 
     def _update_clock(self) -> None:
+        self._ensure_topmost()
         if self.snapshot:
             self._render(self.snapshot)
         self._render_connection_issue()

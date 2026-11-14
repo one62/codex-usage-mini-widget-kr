@@ -6,8 +6,6 @@ import queue
 import subprocess
 import sys
 import threading
-import time
-import tkinter as tk
 import uuid
 import webbrowser
 from datetime import datetime
@@ -22,32 +20,12 @@ for _path in (str(_REPO_ROOT), str(_WIDGET_DIR)):
         sys.path.insert(0, _path)
 
 from common.widget_base import (
-    BG,
-    FONT_FAMILY,
     MUTED,
     PopupMenu,
-    RED,
-    RUN_KEY,
     TEXT,
-    TRACK,
-    WINDOW_HEIGHT,
-    WINDOW_WIDTH,
-    YELLOW,
     BaseUsageWidget,
-    _MonitorInfo,
-    _MouseHookData,
-    _Rect,
-    autostart_enabled_for,
-    clamp_position,
-    enable_dpi_awareness,
-    gradient_color,
-    load_bundled_fonts,
-    monitor_work_area,
-    pythonw_command_for,
-    recovery_delay,
     reset_short,
     run_single_instance,
-    set_autostart_for,
     usage_color,
 )
 from codex_usage import UsageSnapshot, consume_reset_credit, find_codex_executables, query_usage
@@ -59,36 +37,8 @@ from widget_settings import (
     save_settings,
 )
 
-try:
-    from diagnostics.error_log import record_error
-except ModuleNotFoundError as exc:
-    if exc.name not in ("diagnostics", "diagnostics.error_log"):
-        raise
-
-    def record_error(event: str) -> None:
-        pass
-
-try:
-    from diagnostics.topmost import TopmostDiagnostics
-except ModuleNotFoundError as exc:
-    if exc.name not in ("diagnostics", "diagnostics.topmost"):
-        raise
-    TopmostDiagnostics = None
-
 
 RUN_VALUE = "ChatGPTUsageWidget"
-
-
-def pythonw_command() -> str:
-    return pythonw_command_for(Path(__file__).resolve())
-
-
-def autostart_enabled() -> bool:
-    return autostart_enabled_for(RUN_VALUE, Path(__file__).resolve())
-
-
-def set_autostart(enabled: bool) -> None:
-    set_autostart_for(RUN_VALUE, Path(__file__).resolve(), enabled)
 
 
 class UsageWidget(BaseUsageWidget):
@@ -96,7 +46,6 @@ class UsageWidget(BaseUsageWidget):
     RUN_VALUE = RUN_VALUE
 
     def __init__(self) -> None:
-        self._diagnostics = None
         self._init_base(script_path=Path(__file__).resolve())
         self.resetting = False
         self.reset_state_unreadable = False
@@ -105,25 +54,9 @@ class UsageWidget(BaseUsageWidget):
         except (OSError, ValueError, RecursionError):
             self.pending_reset = None
             self.reset_state_unreadable = True
-            record_error("pending_reset_load_failed")
         self.reset_results: queue.Queue[tuple[str, object]] = queue.Queue()
-        self.connection_failed = False
         self._build()
         self._finalize_init()
-
-    def _on_font_load_error(self, _path: str) -> None:
-        record_error("bundled_font_load_failed")
-
-    def _on_settings_save_error(self, _exc: OSError) -> None:
-        record_error("settings_save_failed")
-
-    def _on_mouse_hook_error(self, _exc: Exception) -> None:
-        record_error("mouse_hook_failed")
-
-    def _log_topmost_action(self, message: str, *args: object) -> None:
-        diagnostics = getattr(self, "_diagnostics", None)
-        if diagnostics is not None:
-            diagnostics.log.info(message, *args)
 
     def _load_widget_settings(self):
         return load_settings()
@@ -131,19 +64,22 @@ class UsageWidget(BaseUsageWidget):
     def _save_widget_settings(self, settings) -> None:
         save_settings(settings)
 
-    def _after_window_ready(self) -> None:
-        if TopmostDiagnostics is not None:
-            self._diagnostics = TopmostDiagnostics(self)
-            self._diagnostics.check()
-
     def _start_extra_timers(self) -> None:
         self.root.after(500, self._drain_reset_results)
+
+    def _can_start_refresh(self) -> bool:
+        return not self.refreshing and not self.resetting
+
+    def _on_refresh_state_changed(self) -> None:
+        self._update_reset_menu()
+
+    def _query_usage(self, timeout: float = 18.0) -> UsageSnapshot:
+        return query_usage(timeout=timeout)
 
     def _build(self) -> None:
         logo_path = Path(__file__).resolve().parent / "assets" / "codex-logo.png"
         self._build_header_shell(
             logo_path=logo_path,
-            on_logo_error=lambda: record_error("codex_logo_load_failed"),
             five_fg=TEXT,
             week_fg=TEXT,
         )
@@ -177,95 +113,6 @@ class UsageWidget(BaseUsageWidget):
             subprocess.Popen([executables[0], "app"], creationflags=creation_flags)
         except OSError:
             webbrowser.open("https://chatgpt.com/")
-
-    def refresh(self) -> None:
-        if self.refreshing or self.resetting:
-            return
-        self.refreshing = True
-        self.fetch_generation += 1
-        generation = self.fetch_generation
-        self.menu.entryconfigure(0, state="disabled")
-        self._update_connection_status()
-        self._update_reset_menu()
-        if self.snapshot is None:
-            self.reset_compact.configure(text="…", fg=MUTED)
-        threading.Thread(target=self._fetch_worker, args=(generation,), daemon=True).start()
-        self.root.after(50_000, lambda: self._fetch_watchdog(generation))
-
-    def _fetch_worker(self, generation: int) -> None:
-        for delay in (0.0, 2.0):
-            if delay:
-                time.sleep(delay)
-            try:
-                self.results.put((generation, "ok", query_usage(timeout=18.0)))
-                return
-            except Exception:
-                continue
-        self.results.put((generation, "error", None))
-
-    def _fetch_watchdog(self, generation: int) -> None:
-        if not self.refreshing or generation != self.fetch_generation:
-            return
-        self.fetch_generation += 1  # Ignore a late result from the stuck worker.
-        self.refreshing = False
-        self.menu.entryconfigure(0, state="normal")
-        self._handle_connection_error()
-
-    def _drain_results(self) -> None:
-        try:
-            generation, kind, payload = self.results.get_nowait()
-        except queue.Empty:
-            self.root.after(500, self._drain_results)
-            return
-        if generation != self.fetch_generation:
-            self.root.after(500, self._drain_results)
-            return
-        self.refreshing = False
-        self.menu.entryconfigure(0, state="normal")
-        if kind == "ok" and isinstance(payload, UsageSnapshot):
-            if self.recovery_after_id is not None:
-                self.root.after_cancel(self.recovery_after_id)
-                self.recovery_after_id = None
-            self.connection_failed = False
-            self.failure_count = 0
-            self.snapshot = payload
-            self._update_connection_status()
-            self._render(payload)
-        else:
-            self._handle_connection_error()
-        self.root.after(500, self._drain_results)
-
-    def _handle_connection_error(self) -> None:
-        self.connection_failed = True
-        self._update_connection_status()
-        self._update_reset_menu()
-        self.failure_count += 1
-        record_error("usage_refresh_failed")
-        self._render_connection_issue()
-        if self.recovery_after_id is None:
-            delay = recovery_delay(self.failure_count)
-            self.recovery_after_id = self.root.after(delay * 1000, self._recovery_refresh)
-
-    def _render_connection_issue(self) -> None:
-        if not self.connection_failed:
-            return
-        if self.snapshot is not None and self.failure_count < 3:
-            self.reset_compact.configure(text="retry", fg=YELLOW)
-        else:
-            self.reset_compact.configure(text="offline", fg=MUTED)
-        self._fit_content_width()
-
-    def _update_connection_status(self) -> None:
-        """Display cached query state without starting a connection check."""
-        if self.refreshing:
-            status = "조회 중"
-        elif self.connection_failed:
-            status = "재연결 중"
-        elif self.snapshot is not None:
-            status = "정상"
-        else:
-            status = "확인 전"
-        self.menu.entryconfigure(self.connection_status_index, label=f"연결 상태: {status}")
 
     def _update_reset_menu(self) -> None:
         count = self.snapshot.reset_credit_count if self.snapshot else None
@@ -333,10 +180,13 @@ class UsageWidget(BaseUsageWidget):
             "초기화 대상 기간은 서버가 결정하며, 주간 사용량만 지정할 수는 없습니다."
         )
         if not messagebox.askyesno("사용량 리셋권", prompt, parent=self.root):
+            self._ensure_topmost()
             return
+        self._ensure_topmost()
         # Tk modal dialogs keep timers running, including scheduled refreshes.
         if self.resetting or self.refreshing:
             messagebox.showinfo("사용량 리셋권", "조회가 끝난 뒤 다시 선택해 주세요.", parent=self.root)
+            self._ensure_topmost()
             return
         if not retry and (
             self.connection_failed or self.snapshot is not snapshot or self.pending_reset is not None
@@ -346,8 +196,8 @@ class UsageWidget(BaseUsageWidget):
             try:
                 save_pending_reset(request)
             except OSError:
-                record_error("pending_reset_save_failed")
                 messagebox.showwarning("사용량 리셋권", "요청 기록을 저장하지 못했습니다.", parent=self.root)
+                self._ensure_topmost()
                 return
             self.pending_reset = request
         elif self.pending_reset != request:
@@ -363,7 +213,6 @@ class UsageWidget(BaseUsageWidget):
                 ("ok", consume_reset_credit(request.key, request.executable, request.credit_id))
             )
         except Exception:
-            record_error("reset_request_failed")
             self.reset_results.put(("error", ""))
 
     def _drain_reset_results(self) -> None:
@@ -378,7 +227,7 @@ class UsageWidget(BaseUsageWidget):
             try:
                 save_pending_reset(None)
             except OSError:
-                record_error("pending_reset_clear_failed")
+                pass
             else:
                 self.pending_reset = None
             messages = {
@@ -389,6 +238,7 @@ class UsageWidget(BaseUsageWidget):
             }
             self.refresh()
             messagebox.showinfo("사용량 리셋권", messages[str(payload)], parent=self.root)
+            self._ensure_topmost()
         else:
             self._update_reset_menu()
             messagebox.showwarning(
@@ -397,6 +247,7 @@ class UsageWidget(BaseUsageWidget):
                 "‘리셋권 사용 결과 재확인’에서 같은 리셋권과 요청 키로 확인할 수 있습니다.",
                 parent=self.root,
             )
+            self._ensure_topmost()
         self.root.after(500, self._drain_reset_results)
 
     def _render(self, snapshot: UsageSnapshot) -> None:

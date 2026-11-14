@@ -47,7 +47,6 @@ python widget.py
 
 - 설정: `%LOCALAPPDATA%\CodexUsageMini\settings.json` (투명도·마우스 진입 효과·위치·이동 잠금)
 - 미확정 리셋권 요청: `%LOCALAPPDATA%\CodexUsageMini\pending-reset.json` (재시작 후 같은 요청 재확인에 사용)
-- 오류 로그: 로컬 진단 모듈이 있을 때만 `diagnostics/widget.log`에 오류 유형 기록
 
 사용량 조회는 설치된 Codex 클라이언트의 인증을 사용하며, 별도 API 키 입력은 필요하지 않습니다.
 

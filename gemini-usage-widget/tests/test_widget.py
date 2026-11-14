@@ -14,9 +14,28 @@ from pathlib import Path
 from unittest import mock
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_WIDGET_DIR = Path(__file__).resolve().parents[1]
+_REPO_ROOT = _WIDGET_DIR.parent
+for _path in (str(_REPO_ROOT), str(_WIDGET_DIR)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 import gemini_usage
+from common.widget_base import (
+    FONT_FAMILY,
+    MUTED,
+    TRACK,
+    YELLOW,
+    _MouseHookData,
+    _Rect,
+    clamp_position,
+    enable_dpi_awareness,
+    gradient_color,
+    load_bundled_fonts,
+    recovery_delay,
+    reset_short,
+    usage_color,
+)
 from gemini_usage import (
     LimitWindow,
     UsageError,
@@ -33,21 +52,8 @@ from gemini_usage import (
 )
 from widget import (
     FIVE_HOUR_TEXT,
-    FONT_FAMILY,
-    MUTED,
-    TRACK,
     WEEK_TEXT,
-    YELLOW,
     UsageWidget,
-    _MouseHookData,
-    _Rect,
-    clamp_position,
-    enable_dpi_awareness,
-    gradient_color,
-    load_bundled_fonts,
-    recovery_delay,
-    reset_short,
-    usage_color,
 )
 
 
@@ -163,6 +169,22 @@ class ParseUserQuotaTests(unittest.TestCase):
         self.assertEqual(snapshot.seven_day.used_percent, 35)
         self.assertEqual(snapshot.claude_gpt_five_hour.used_percent, 100)
         self.assertEqual(snapshot.claude_gpt_seven_day.used_percent, 50)
+
+    def test_preserves_zero_credit_balance(self):
+        snapshot = parse_user_quota(
+            {
+                "userStatus": {
+                    "userTier": {
+                        "name": "Google AI Pro",
+                        "availableCredits": [{"creditType": "GOOGLE_ONE_AI", "creditAmount": "0"}],
+                    },
+                    "buckets": [
+                        {"modelId": "gemini-2.5-flash", "remainingFraction": 0.5},
+                    ],
+                }
+            }
+        )
+        self.assertEqual(snapshot.credit_balance, 0)
 
     def test_parses_language_server_command_line(self):
         cmd = (
@@ -475,7 +497,7 @@ class WidgetHelpersTests(unittest.TestCase):
 
     def test_reset_short_formats_compact_ranges(self):
         self.assertEqual(reset_short(None), "—")
-        with mock.patch("widget.time.time", return_value=1_000_000.0):
+        with mock.patch("common.widget_base.time.time", return_value=1_000_000.0):
             self.assertEqual(reset_short(1_000_000), "now")
             self.assertEqual(reset_short(1_000_000 + 86_400), "24h 0m")
             self.assertEqual(reset_short(1_000_000 + 90_000), "1d 1h")
@@ -551,7 +573,7 @@ class WidgetHelpersTests(unittest.TestCase):
             [TRACK] * 5,
         )
 
-    def test_connection_issue_keeps_retry_and_uses_muted_dash_when_offline(self):
+    def test_connection_issue_keeps_retry_and_shows_offline_when_unavailable(self):
         widget = UsageWidget.__new__(UsageWidget)
         widget.reset_compact = mock.Mock()
         widget._fit_content_width = mock.Mock()
@@ -565,17 +587,17 @@ class WidgetHelpersTests(unittest.TestCase):
 
         widget.failure_count = 3
         widget._render_connection_issue()
-        widget.reset_compact.configure.assert_called_with(text="—", fg=MUTED)
+        widget.reset_compact.configure.assert_called_with(text="offline", fg=MUTED)
 
         widget.failure_count = 1
         widget.auth_required = True
         widget._render_connection_issue()
-        widget.reset_compact.configure.assert_called_with(text="—", fg=MUTED)
+        widget.reset_compact.configure.assert_called_with(text="offline", fg=MUTED)
 
         widget.auth_required = False
         widget.snapshot = None
         widget._render_connection_issue()
-        widget.reset_compact.configure.assert_called_with(text="—", fg=MUTED)
+        widget.reset_compact.configure.assert_called_with(text="offline", fg=MUTED)
 
     @unittest.skipUnless(os.name == "nt", "Requires Windows Tk font metrics")
     def test_right_aligned_columns_match_codex_5h_width_and_do_not_clip_labels(self):
@@ -805,6 +827,23 @@ class MouseGestureTests(unittest.TestCase):
         api.GetAncestor.return_value = 789
         widget._dismiss_menu_outside(600, 500)
         self.assertEqual(widget._mouse_events.get_nowait(), ("dismiss", 600, 500))
+
+    def test_ensure_topmost_restores_when_native_flag_cleared(self):
+        widget = self.widget
+        widget._closing = False
+        widget.always_on_top = mock.Mock()
+        widget.always_on_top.get.return_value = True
+        widget._input_hwnd = 100
+        api = widget._input_api = mock.Mock()
+
+        api.GetWindowLongW.return_value = 0x80028  # WS_EX_TOPMOST (0x8) already set
+        widget._ensure_topmost()
+        widget.root.attributes.assert_not_called()
+
+        api.GetWindowLongW.return_value = 0x80020  # WS_EX_TOPMOST (0x8) cleared
+        widget._ensure_topmost()
+        widget.root.attributes.assert_called_once_with("-topmost", True)
+        widget.root.lift.assert_called_once_with()
 
 
 if __name__ == "__main__":

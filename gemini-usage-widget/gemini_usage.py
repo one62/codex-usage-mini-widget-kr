@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ctypes
 import json
-import logging
 import os
 import re
 import shutil
@@ -21,8 +20,6 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
-
-LOGGER = logging.getLogger("gemini-usage-mini-widget")
 
 _SERVICE_PREFIX = "/exa.language_server_pb.LanguageServerService"
 _GET_USER_STATUS_PATH = f"{_SERVICE_PREFIX}/GetUserStatus"
@@ -64,10 +61,6 @@ class AuthRequiredError(UsageError):
 class LimitWindow:
     used_percent: int
     resets_at: int | None
-
-    @property
-    def remaining_percent(self) -> int:
-        return max(0, min(100, 100 - self.used_percent))
 
 
 @dataclass(frozen=True)
@@ -1237,13 +1230,12 @@ def parse_user_quota(
         plan = plan_candidate.strip()
 
     # 5. Extract AI Credits Balance
-    credit_balance = (
-        _extract_credits_from_obj(user_tier)
-        or _extract_credits_from_obj(paid_tier)
-        or _extract_credits_from_obj(plan_status)
-        or _extract_credits_from_obj(user_status)
-        or (_extract_credits_from_obj(summary_result) if isinstance(summary_result, dict) else None)
-    )
+    credit_balance: int | None = None
+    for credit_source in (user_tier, paid_tier, plan_status, user_status, summary_result):
+        candidate_credits = _extract_credits_from_obj(credit_source)
+        if candidate_credits is not None:
+            credit_balance = candidate_credits
+            break
 
     return UsageSnapshot(
         plan=plan,
@@ -1289,8 +1281,6 @@ def _fetch_endpoint_payloads(
                 status_payload = result
         except urllib.error.HTTPError as exc:
             last_exc = exc
-            if is_summary:
-                LOGGER.debug("RetrieveUserQuotaSummary HTTP %s on %s://port=%s", exc.code, scheme, port)
         except Exception as exc:
             last_exc = exc
             if not is_summary and summary_payload is None:
@@ -1300,13 +1290,6 @@ def _fetch_endpoint_payloads(
         if last_exc is not None:
             raise last_exc
         raise UsageError("Antigravity 로컬 서버 응답이 없습니다.")
-
-    if isinstance(summary_payload, dict) and not _unwrap_summary_groups(summary_payload):
-        LOGGER.warning(
-            "RetrieveUserQuotaSummary returned unexpected keys on port=%s: %s",
-            port,
-            sorted(summary_payload.keys()),
-        )
 
     return status_payload, summary_payload
 
@@ -1411,11 +1394,6 @@ def query_usage(timeout: float = 15.0) -> UsageSnapshot:
 
                     if best_partial is None:
                         best_partial = (snapshot, cache_entry)
-                    LOGGER.info(
-                        "Endpoint port=%s (%s) returned 5H only; continuing probe for weekly limits",
-                        port,
-                        proc.name,
-                    )
                     # Stop trying http on the same port once https succeeded, and check next port/process.
                     break
                 except urllib.error.HTTPError as exc:

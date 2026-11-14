@@ -46,7 +46,6 @@ python widget.py
 ## 저장 파일
 
 - 설정: `%LOCALAPPDATA%\GeminiUsageMini\settings.json` (투명도·마우스 진입 효과·위치·이동 잠금)
-- 오류 로그: `%LOCALAPPDATA%\GeminiUsageMini\widget.log`
 
 사용량 조회는 실행 중인 Antigravity의 로컬 Language Server(`RetrieveUserQuotaSummary`, `GetUserStatus`)를 통해 안전하게 읽어오며, 별도 OAuth 토큰 추출이나 API 키 입력은 필요하지 않습니다.
 

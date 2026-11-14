@@ -12,10 +12,23 @@ from pathlib import Path
 from unittest import mock
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_WIDGET_DIR = Path(__file__).resolve().parents[1]
+_REPO_ROOT = _WIDGET_DIR.parent
+for _path in (str(_REPO_ROOT), str(_WIDGET_DIR)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 from codex_usage import UsageError, find_codex_executables, parse_rate_limits
-from widget import FONT_FAMILY, UsageWidget, _MouseHookData, _Rect, enable_dpi_awareness, clamp_position, gradient_color, load_bundled_fonts, recovery_delay
+from common.widget_base import (
+    _MouseHookData,
+    _Rect,
+    clamp_position,
+    enable_dpi_awareness,
+    gradient_color,
+    load_bundled_fonts,
+    recovery_delay,
+)
+from widget import UsageWidget
 
 
 class ParseRateLimitsTests(unittest.TestCase):
@@ -305,6 +318,23 @@ class MouseGestureTests(unittest.TestCase):
         api.GetAncestor.return_value = 789
         widget._dismiss_menu_outside(600, 500)
         self.assertEqual(widget._mouse_events.get_nowait(), ("dismiss", 600, 500))
+
+    def test_ensure_topmost_restores_when_native_flag_cleared(self):
+        widget = self.widget
+        widget._closing = False
+        widget.always_on_top = mock.Mock()
+        widget.always_on_top.get.return_value = True
+        widget._input_hwnd = 100
+        api = widget._input_api = mock.Mock()
+
+        api.GetWindowLongW.return_value = 0x80028  # WS_EX_TOPMOST (0x8) already set
+        widget._ensure_topmost()
+        widget.root.attributes.assert_not_called()
+
+        api.GetWindowLongW.return_value = 0x80020  # WS_EX_TOPMOST (0x8) cleared
+        widget._ensure_topmost()
+        widget.root.attributes.assert_called_once_with("-topmost", True)
+        widget.root.lift.assert_called_once_with()
 
 
 if __name__ == "__main__":
